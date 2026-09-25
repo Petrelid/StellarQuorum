@@ -167,6 +167,7 @@ cargo build --target wasm32-unknown-unknown --release
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo audit --config audit.toml
+cd .. && bash scripts/check-wasm-size.sh   # wasm size regression check
 ```
 
 ### 2. Frontend (`frontend/`)
@@ -309,7 +310,38 @@ cargo build --target wasm32-unknown-unknown --release
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo audit --config audit.toml
+cd .. && bash scripts/check-wasm-size.sh   # wasm size regression check
 ```
+
+### WASM Size Baseline
+
+Soroban charges rent on the deployed contract bytes, so the size of the two
+wasm artifacts is a real cost that must not grow unnoticed. CI builds both
+artifacts, records their sizes in the job summary (and as the
+`wasm-size-report` artifact), and fails the build if either has grown more
+than **10%** over the committed baseline.
+
+Check locally after a release build:
+
+```bash
+bash scripts/check-wasm-size.sh   # or: npm run check:wasm-size
+```
+
+**Current baseline** (`contracts/wasm-size-baseline.txt`, release profile):
+
+| Artifact | Baseline |
+| --- | ---: |
+| `quorum_token.wasm` | 20,483 bytes |
+| `quorum_governance.wasm` | 28,536 bytes |
+
+The threshold is 10% per artifact (`WASM_SIZE_MAX_GROWTH_PCT` overrides it),
+which leaves room for rustc/toolchain drift between your machine and CI while
+still catching a dependency bump or new feature that bloats a contract.
+
+If the growth is intentional (e.g. a deliberate feature that adds code), copy
+the `Current` sizes the script prints into `contracts/wasm-size-baseline.txt`
+and explain the growth in the PR description — reviewers should see the new
+cost in the diff.
 
 ---
 
