@@ -30,13 +30,16 @@ The quorum threshold is the minimum total voting power (For + Against + Abstain)
 
 Voting power is derived from QUORUM token balance at the snapshot ledger taken at proposal creation. This prevents flash-loan manipulation of governance votes.
 
+A voter's weight is therefore their balance *at the snapshot*, not their current balance, so the two disagree for anyone who bought or sold after the proposal opened. The proposal page reads the balance at the snapshot for the connected wallet and shows it above the vote buttons, before anything is signed — including the case where it is zero, which the contract rejects with `NoVotingPower`. See `frontend/components/VotingPowerPreview.tsx`.
+
 ### Timelock
 
 All passed proposals enter a 48-hour timelock before execution. A guardian multisig can veto during this window as a safety net against governance attacks.
 
 ## Roadmap
 
-- [ ] Freighter wallet integration for live voting on Stellar testnet
+- [x] Freighter wallet connection — connect, connected address, and the snapshot voting-power preview
+- [ ] Sign and submit votes on Stellar testnet through Freighter
 - [ ] Soroban governance contract testnet deployment
 - [ ] Token delegation UI — delegate voting power without transferring tokens
 - [ ] Timelock execution engine — automated execution after 48h delay
@@ -61,7 +64,7 @@ Rewarded issues use `drips:*` labels to show the expected points value:
 | `drips:5` | Large tasks such as new pages or contract functions |
 | `drips:8` | Complex tasks such as full features or security-sensitive work |
 
-See [docs/contributing.md](docs/contributing.md#drips-wave) for the contributor
+See [CONTRIBUTING.md](CONTRIBUTING.md#drips-wave) for the contributor
 claim flow and maintainer setup checklist.
 
 **Good first issues:**
@@ -79,6 +82,9 @@ claim flow and maintainer setup checklist.
 2. Make your changes with clear commit messages
 3. Open a PR referencing the issue
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide, the
+[Code of Conduct](CODE_OF_CONDUCT.md), and the [CHANGELOG](CHANGELOG.md).
+
 ---
 
 ## License
@@ -88,6 +94,21 @@ MIT — free to use, modify, and distribute.
 ---
 
 ## SDK Reference
+
+### Install
+
+```bash
+npm install @quorum/sdk
+# Optional — only if you use the Freighter signing helper
+npm install @stellar/freighter-api
+```
+
+The package ships ESM and CJS builds, so both styles work:
+
+```typescript
+import { QuorumClient } from '@quorum/sdk';        // ESM / bundlers
+const { QuorumClient } = require('@quorum/sdk');   // CommonJS
+```
 
 ### `QuorumClient`
 
@@ -104,9 +125,97 @@ await client.getConfig();               // Protocol config (quorum, voting perio
 await client.hasVoted(1n, 'G...');      // Check if address voted
 await client.getVote(1n, 'G...');       // How they voted: 0=Against, 1=For, 2=Abstain, null=not voted
 
+await client.getLatestLedger();
+// Current ledger sequence, for converting proposal ledgers to dates
 // Build transactions (returns unsigned XDR for Freighter signing)
 await client.buildCreateProposal(address, title, description);
 await client.buildVote(voter, proposalId, support); // support: 0=Against, 1=For, 2=Abstain
 await client.buildFinalize(proposalId);
 await client.buildExecute(proposalId);
 ```
+
+### Signing with Freighter
+
+`build*` returns unsigned XDR. The helper behind the optional
+`@quorum/sdk/freighter` entry point detects the extension, requests access and
+signs in one call — the package root never loads it, so Node consumers are
+unaffected:
+
+```typescript
+import { signWithFreighter, FreighterError, FreighterErrorCode } from '@quorum/sdk/freighter';
+
+try {
+  const xdr = await client.buildVote(voter, proposalId, 1);
+  const { signedXdr, signerAddress } = await signWithFreighter(xdr, {
+    networkPassphrase: TESTNET.networkPassphrase!,
+  });
+  // submit signedXdr with your RPC of choice
+} catch (e) {
+  if (e instanceof FreighterError && e.code === FreighterErrorCode.Locked) {
+    // prompt the user to unlock the wallet
+  }
+}
+```
+
+Failures are always a `FreighterError` with a `code`: `NOT_INSTALLED`,
+`LOCKED`, `ACCESS_DENIED`, `SIGNING_REJECTED` or `WALLET_ERROR`.
+`isFreighterAvailable()` and `getFreighterAddress()` cover connect flows.
+
+### Decoding contract events
+
+Every event the governance and token contracts emit has a TypeScript type and
+a decoder, so consumers (for example real-time vote counts) never touch raw
+XDR:
+
+```typescript
+import { decodeEvent, decodeEvents } from '@quorum/sdk';
+
+const events = await server.getEvents({ filters: [{ type: 'contract' }] });
+for (const raw of decodeEvents(events.events)) {
+  switch (raw.type) {
+    case 'vote_cast':            // proposalId, voter, support, votingPower
+    case 'proposal_finalized':   // id, status, forVotes, againstVotes, abstainVotes
+    case 'transfer':             // from, to, amount
+  }
+}
+```
+
+Known topics: `proposal_created`, `vote_cast`, `proposal_finalized`,
+`proposal_queued`, `proposal_executed`, `proposal_cancelled`, `transfer`,
+`mint`, `burn`, `approve`, `admin_transferred`. Unknown topics decode to
+`null` and are skipped rather than throwing.
+
+### Contract errors
+
+Contract failures surface as `Error(Contract, #N)`. `GovernanceError` and `TokenError` mirror the Rust `#[contracterror]` enums with the same codes:
+
+```typescript
+import { parseGovernanceError, GovernanceError } from '@quorum/sdk';
+
+try { /* ... */ } catch (e) {
+  if (parseGovernanceError(e) === GovernanceError.QuorumNotReached) { /* ... */ }
+}
+```
+
+### Releases
+
+`@quorum/sdk` releases are tagged `sdk-vX.Y.Z` and published to npm by CI with
+provenance. Pre-1.0 the package follows `0.MINOR.PATCH`: PATCH for fixes,
+MINOR for features *and* breaking changes until 1.0. See
+[docs/publishing.md](docs/publishing.md) for the scope/credential setup, the
+full versioning policy and the release checklist.
+
+## Frontend data source
+
+The frontend reads proposals from the governance contract through `QuorumClient`. Configure it with environment variables (e.g. in `frontend/.env.local`; `frontend/.env.example` documents every one of them):
+
+| Variable | Default | |
+|---|---|---|
+| `NEXT_PUBLIC_GOVERNANCE_CONTRACT_ID` | — | Governance contract to read. Must be a valid contract ID. |
+| `NEXT_PUBLIC_STELLAR_RPC_URL` | testnet RPC | Soroban RPC endpoint. |
+| `NEXT_PUBLIC_STELLAR_NETWORK_PASSPHRASE` | testnet | Network passphrase. |
+| `NEXT_PUBLIC_TOKEN_CONTRACT_ID` | governance config | Token contract to read balances from. Optional: the client falls back to the token address in `get_config()`. |
+| `NEXT_PUBLIC_USE_FIXTURE` | — | `1` to serve the bundled mock proposals instead; `0` to require a contract ID and fail fast without one. |
+| `NEXT_PUBLIC_SITE_URL` | `https://quorum.stellar.org` | Absolute origin of the deployment, used by `robots.txt` and the sitemap. |
+
+The environment is validated once at startup by `frontend/lib/env.ts`: contract IDs are checked as strkeys (version byte and CRC-16 included, so a transposed character is caught), URLs are checked as absolute, and every problem is reported at once with the variable that needs fixing. With no contract ID set the frontend falls back to the mock fixture in `frontend/lib/proposals.ts`, so `npm run dev` works offline without a deployment; set `NEXT_PUBLIC_USE_FIXTURE=0` in a deployment to turn that fallback into a startup failure. Voting power uses a matching fixture in `frontend/lib/voting-power.ts`, keyed by address suffix — an address ending `3XZK` holds 2,500 QUORUM at the snapshot and 4,000 now, one ending `7MKL` holds 150,000 at both, and any other address held nothing at the snapshot. The frontend depends on the local SDK, so build it first: `npm run build:sdk`.

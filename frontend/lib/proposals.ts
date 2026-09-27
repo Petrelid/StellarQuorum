@@ -1,4 +1,13 @@
-import type { Proposal } from "./types";
+// Proposals are read from the governance contract through QuorumClient. The
+// PROPOSALS fixture below is served instead when USE_FIXTURE is on, so the UI
+// runs locally without a deployment. See "Frontend data source" in the README.
+import type { Proposal as ChainProposal } from "@quorum/sdk";
+import type { Proposal, ProposalStatus } from "./types";
+import { USE_FIXTURE, createQuorumClient } from "./config";
+
+/** Average Stellar ledger close time, used to estimate voting window dates. */
+const SECONDS_PER_LEDGER = 5;
+
 
 export const PROPOSALS: Proposal[] = [
   {
@@ -9,6 +18,7 @@ export const PROPOSALS: Proposal[] = [
     status: "active",
     startTime: "2026-05-12T10:00:00Z",
     endTime: "2026-05-19T10:00:00Z",
+    snapshotLedger: 61_284_512,
     forVotes: 842000,
     againstVotes: 124000,
     abstainVotes: 34000,
@@ -31,6 +41,7 @@ export const PROPOSALS: Proposal[] = [
     status: "passed",
     startTime: "2026-04-28T00:00:00Z",
     endTime: "2026-05-05T00:00:00Z",
+    snapshotLedger: 60_918_264,
     forVotes: 1200000,
     againstVotes: 89000,
     abstainVotes: 45000,
@@ -52,6 +63,7 @@ export const PROPOSALS: Proposal[] = [
     status: "failed",
     startTime: "2026-05-02T18:00:00Z",
     endTime: "2026-05-04T18:00:00Z",
+    snapshotLedger: 61_006_880,
     forVotes: 310000,
     againstVotes: 580000,
     abstainVotes: 22000,
@@ -72,6 +84,7 @@ export const PROPOSALS: Proposal[] = [
     status: "active",
     startTime: "2026-05-15T00:00:00Z",
     endTime: "2026-05-22T00:00:00Z",
+    snapshotLedger: 61_337_096,
     forVotes: 620000,
     againstVotes: 88000,
     abstainVotes: 56000,
@@ -92,6 +105,7 @@ export const PROPOSALS: Proposal[] = [
     status: "executed",
     startTime: "2026-04-01T00:00:00Z",
     endTime: "2026-04-08T00:00:00Z",
+    snapshotLedger: 60_604_432,
     forVotes: 1800000,
     againstVotes: 45000,
     abstainVotes: 12000,
@@ -115,6 +129,7 @@ export const PROPOSALS: Proposal[] = [
     status: "passed",
     startTime: "2026-04-20T00:00:00Z",
     endTime: "2026-04-27T00:00:00Z",
+    snapshotLedger: 60_877_190,
     forVotes: 980000,
     againstVotes: 22000,
     abstainVotes: 8000,
@@ -134,6 +149,7 @@ export const PROPOSALS: Proposal[] = [
     status: "pending",
     startTime: "2026-05-25T00:00:00Z",
     endTime: "2026-06-01T00:00:00Z",
+    snapshotLedger: 61_402_776,
     forVotes: 0,
     againstVotes: 0,
     abstainVotes: 0,
@@ -150,6 +166,7 @@ export const PROPOSALS: Proposal[] = [
     status: "failed",
     startTime: "2026-03-15T00:00:00Z",
     endTime: "2026-03-22T00:00:00Z",
+    snapshotLedger: 60_551_004,
     forVotes: 390000,
     againstVotes: 620000,
     abstainVotes: 90000,
@@ -164,6 +181,50 @@ export const PROPOSALS: Proposal[] = [
   },
 ];
 
-export function getProposalById(id: string): Proposal | undefined {
-  return PROPOSALS.find(p => p.id === id);
+export async function getProposals(): Promise<Proposal[]> {
+  if (USE_FIXTURE) return PROPOSALS;
+  const client = await createQuorumClient();
+  const [proposals, latestLedger] = await Promise.all([client.getAllProposals(), client.getLatestLedger()]);
+  // Newest first, matching the fixture's "recent" ordering on the home page.
+  return proposals.map(p => toUiProposal(p, latestLedger)).reverse();
+}
+
+export async function getProposalById(id: string): Promise<Proposal | undefined> {
+  if (USE_FIXTURE) return PROPOSALS.find(p => p.id === id);
+  const match = /^QIP-(\d+)$/.exec(id);
+  if (!match) return undefined;
+  const client = await createQuorumClient();
+  const [proposal, latestLedger] = await Promise.all([client.getProposal(BigInt(match[1])), client.getLatestLedger()]);
+  return proposal ? toUiProposal(proposal, latestLedger) : undefined;
+}
+
+/**
+ * Maps a contract proposal onto the UI shape. The contract stores no category,
+ * actions or per-vote history, and counts time in ledgers, so those fields are
+ * filled with neutral defaults and ledger-based date estimates.
+ */
+export function toUiProposal(p: ChainProposal, latestLedger: number, now = Date.now()): Proposal {
+  const ledgerTime = (ledger: number) =>
+    new Date(now + (ledger - latestLedger) * SECONDS_PER_LEDGER * 1000).toISOString();
+  return {
+    id: `QIP-${String(p.id).padStart(3, "0")}`,
+    title: p.title,
+    description: p.description,
+    proposer: p.proposer,
+    // The UI has no "queued" state; a queued proposal has passed and awaits its timelock.
+    status: (p.status === "Queued" ? "passed" : p.status.toLowerCase()) as ProposalStatus,
+    startTime: ledgerTime(p.startLedger),
+    endTime: ledgerTime(p.endLedger),
+    // The ledger a vote on this proposal is weighted by, not by the voter's
+    // balance today. The voting-power preview reads the voter's balance here.
+    snapshotLedger: p.snapshotLedger,
+    // ponytail: raw token units; divide by the token's decimals once the UI reads them.
+    forVotes: Number(p.forVotes),
+    againstVotes: Number(p.againstVotes),
+    abstainVotes: Number(p.abstainVotes),
+    quorumRequired: Number(p.quorumRequired),
+    category: "General",
+    actions: [],
+    votes: [],
+  };
 }

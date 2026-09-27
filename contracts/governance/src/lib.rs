@@ -1,4 +1,7 @@
 #![no_std]
+#[cfg(test)]
+extern crate std;
+
 use soroban_sdk::{contract, contractclient, contractimpl, contracttype, contracterror, Address, Env, String, Symbol};
 
 /// Subset of the QUORUM token interface the governor depends on.
@@ -30,10 +33,18 @@ pub enum GovernanceError {
     TimelockNotExpired      = 12,
     Overflow                = 13,
     NoVotingPower           = 14,
+    ExecutionExpired        = 15,
+    ContractPaused          = 16,
 }
 
 /// Basis-point denominator: `quorum_bps` of 500 means 5% of total supply.
 const BPS_DENOMINATOR: i128 = 10_000;
+
+/// Largest `quorum_bps` that can still be reached. 10000 means "the entire
+/// supply must vote", which is a legitimate (if strict) setting; anything
+/// above it demands more votes than exist, so no proposal could ever reach
+/// quorum and there is no way to recover the parameter.
+const MAX_QUORUM_BPS: u32 = 10_000;
 
 /// Ledgers in roughly one day, at Stellar's ~5 second close time.
 const LEDGERS_PER_DAY: u32 = 17_280;
@@ -59,6 +70,21 @@ pub struct ProposalCreated {
     pub start_ledger: u32,
     pub end_ledger: u32,
     pub quorum_required: i128,
+    pub metadata_uri: String,
+}
+
+/// Emitted when the contract is paused.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractPaused {
+    pub caller: Address,
+}
+
+/// Emitted when the contract is unpaused.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUnpaused {
+    pub caller: Address,
 }
 
 /// Emitted for each accepted vote. `voting_power` is the weight actually
@@ -96,6 +122,7 @@ pub struct ProposalQueued {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProposalExecuted {
     pub id: u64,
+    pub executor: Address,
 }
 
 #[contracttype]
@@ -107,8 +134,15 @@ pub struct ProposalCancelled {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferred {
+    pub previous_admin: Address,
+    pub new_admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProposalStatus {
-    Pending, Active, Passed, Failed, Queued, Executed, Cancelled,
+    Pending, Active, Passed, Failed, Queued, Executed, Cancelled, Expired,
 }
 
 #[contracttype]
@@ -127,9 +161,11 @@ pub struct Proposal {
     pub queue_ledger: u32,
     pub quorum_required: i128,
     pub status: ProposalStatus,
+    pub metadata_uri: String,
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub token: Address,
     pub quorum_bps: u32,
@@ -137,6 +173,9 @@ pub struct Config {
     pub timelock_period: u32,
     pub proposal_threshold: i128,
     pub admin: Address,
+    pub guardian: Address,
+    pub execution_grace_period: u32,
+    pub paused: bool,
 }
 
 #[contracttype]
@@ -146,6 +185,7 @@ pub enum DataKey {
     Proposal(u64),
     HasVoted(u64, Address),
     Delegate(Address),
+    PendingAdmin,
 }
 
 #[contract]
@@ -153,23 +193,40 @@ pub struct GovernanceContract;
 
 #[contractimpl]
 impl GovernanceContract {
-    pub fn initialize(env: Env, admin: Address, token: Address, quorum_bps: u32, voting_period: u32, timelock_period: u32, proposal_threshold: i128) -> Result<(), GovernanceError> {
+    pub fn initialize(env: Env, admin: Address, guardian: Address, token: Address, quorum_bps: u32, voting_period: u32, timelock_period: u32, execution_grace_period: u32, proposal_threshold: i128) -> Result<(), GovernanceError> {
         if env.storage().instance().has(&DataKey::Config) {
             return Err(GovernanceError::AlreadyInitialized);
         }
+        // Reject an unreachable quorum before any state is written. Above
+        // MAX_QUORUM_BPS the required votes exceed the total supply, so every
+        // proposal would fail forever and the parameter could never be fixed.
+        if quorum_bps > MAX_QUORUM_BPS {
+            return Err(GovernanceError::InvalidQuorumBps);
+        }
         admin.require_auth();
-        let config = Config { token, quorum_bps, voting_period, timelock_period, proposal_threshold, admin };
+        let config = Config { token, quorum_bps, voting_period, timelock_period, proposal_threshold, admin, guardian, execution_grace_period, paused: false };
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::ProposalCount, &0u64);
         Ok(())
     }
 
-    pub fn create_proposal(env: Env, proposer: Address, title: String, description: String) -> Result<u64, GovernanceError> {
+    pub fn version(env: Env) -> String {
+        String::from_str(&env, env!("CARGO_PKG_VERSION"))
+    }
+
+    pub fn create_proposal(env: Env, proposer: Address, title: String, description: String, metadata_uri: String) -> Result<u64, GovernanceError> {
+        let config: Config = Self::require_config(&env)?;
         proposer.require_auth();
+        let config: Config = env.storage().instance().get(&DataKey::Config).unwrap();
+        
+        // Check if contract is paused
+        if config.paused {
+            return Err(GovernanceError::ContractPaused);
+        }
+        
         let count: u64 = env.storage().instance().get(&DataKey::ProposalCount).unwrap_or(0);
         let id = count + 1;
         let current = env.ledger().sequence();
-        let config: Config = env.storage().instance().get(&DataKey::Config).unwrap();
         let token = TokenClient::new(&env, &config.token);
 
         // Gate proposal creation on a real stake, so spamming the proposal
@@ -200,6 +257,7 @@ impl GovernanceContract {
             queue_ledger: 0,
             quorum_required,
             status: ProposalStatus::Active,
+            metadata_uri: metadata_uri.clone(),
         };
         env.storage().persistent().set(&DataKey::Proposal(id), &proposal);
         env.storage().instance().set(&DataKey::ProposalCount, &id);
@@ -215,12 +273,14 @@ impl GovernanceContract {
                 start_ledger: proposal.start_ledger,
                 end_ledger: proposal.end_ledger,
                 quorum_required: proposal.quorum_required,
+                metadata_uri,
             },
         );
         Ok(id)
     }
 
     pub fn vote(env: Env, voter: Address, proposal_id: u64, support: u32) -> Result<(), GovernanceError> {
+        let config: Config = Self::require_config(&env)?;
         voter.require_auth();
         if support > 2 { return Err(GovernanceError::InvalidVoteChoice); }
         if env.storage().persistent().has(&DataKey::HasVoted(proposal_id, voter.clone())) {
@@ -233,7 +293,6 @@ impl GovernanceContract {
 
         // Power is read at the proposal's snapshot ledger, not live, so tokens
         // bought or borrowed after the proposal opened carry no weight.
-        let config: Config = env.storage().instance().get(&DataKey::Config).unwrap();
         let voting_power = TokenClient::new(&env, &config.token)
             .get_past_balance(&voter, &proposal.snapshot_ledger);
         if voting_power <= 0 { return Err(GovernanceError::NoVotingPower); }
@@ -258,6 +317,7 @@ impl GovernanceContract {
     }
 
     pub fn finalize(env: Env, proposal_id: u64) -> Result<ProposalStatus, GovernanceError> {
+        let config: Config = Self::require_config(&env)?;
         let mut proposal: Proposal = env.storage().persistent()
             .get(&DataKey::Proposal(proposal_id)).ok_or(GovernanceError::ProposalNotFound)?;
         if env.ledger().sequence() <= proposal.end_ledger { return Err(GovernanceError::VotingNotActive); }
@@ -307,11 +367,29 @@ impl GovernanceContract {
         Ok(status)
     }
 
-    pub fn execute(env: Env, proposal_id: u64) -> Result<(), GovernanceError> {
+    pub fn execute(env: Env, executor: Address, proposal_id: u64) -> Result<(), GovernanceError> {
+        executor.require_auth();
+        let config: Config = env.storage().instance().get(&DataKey::Config).unwrap();
+        
+        // Check if contract is paused
+        if config.paused {
+            return Err(GovernanceError::ContractPaused);
+        }
+        
         let mut proposal: Proposal = env.storage().persistent()
             .get(&DataKey::Proposal(proposal_id)).ok_or(GovernanceError::ProposalNotFound)?;
         if proposal.status != ProposalStatus::Queued { return Err(GovernanceError::ProposalNotPassed); }
         if env.ledger().sequence() < proposal.queue_ledger { return Err(GovernanceError::TimelockNotExpired); }
+        
+        // Check if execution grace period has expired
+        let execution_deadline = proposal.queue_ledger + config.execution_grace_period;
+        if config.execution_grace_period > 0 && env.ledger().sequence() > execution_deadline {
+            return Err(GovernanceError::ExecutionExpired);
+        }
+
+        // Commit the terminal state before dispatching any proposal actions.
+        // Once action calls are added, a callee may synchronously call execute
+        // again; it must observe Executed and fail rather than dispatch twice.
         proposal.status = ProposalStatus::Executed;
         env.storage().persistent().set(&DataKey::Proposal(proposal_id), &proposal);
         Self::touch_proposal(&env, proposal_id);
@@ -319,8 +397,29 @@ impl GovernanceContract {
 
         env.events().publish(
             (Symbol::new(&env, "proposal_executed"), proposal_id),
-            ProposalExecuted { id: proposal_id },
+            ProposalExecuted { id: proposal_id, executor },
         );
+        Ok(())
+    }
+
+    /// Transfer governance administration. Two-step process for safety.
+    /// Only the current admin may initiate the transfer.
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), GovernanceError> {
+        let config = Self::get_config(env.clone());
+        config.admin.require_auth();
+        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        Ok(())
+    }
+
+    /// Accept admin role. Called by the pending admin to complete the transfer.
+    pub fn accept_admin(env: Env) -> Result<(), GovernanceError> {
+        let pending: Address = env.storage().instance().get(&DataKey::PendingAdmin)
+            .ok_or(GovernanceError::Unauthorized)?;
+        pending.require_auth();
+        let mut config = Self::get_config(env.clone());
+        config.admin = pending;
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
         Ok(())
     }
 
@@ -354,14 +453,14 @@ impl GovernanceContract {
     }
 
     pub fn get_config(env: Env) -> Config {
-        env.storage().instance().get(&DataKey::Config).unwrap()
+        Self::require_config(&env).unwrap()
     }
 
     pub fn cancel(env: Env, caller: Address, proposal_id: u64) -> Result<(), GovernanceError> {
+        let config: Config = Self::require_config(&env)?;
         caller.require_auth();
         let mut proposal: Proposal = env.storage().persistent()
             .get(&DataKey::Proposal(proposal_id)).ok_or(GovernanceError::ProposalNotFound)?;
-        let config: Config = env.storage().instance().get(&DataKey::Config).unwrap();
         if caller != proposal.proposer && caller != config.admin {
             return Err(GovernanceError::Unauthorized);
         }
@@ -375,10 +474,107 @@ impl GovernanceContract {
         );
         Ok(())
     }
+
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), GovernanceError> {
+        let config = Self::get_config(env.clone());
+        config.admin.require_auth();
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        Ok(())
+    }
+
+    /// Pause the contract. Only admin or guardian can pause.
+    /// Blocks proposal creation and execution.
+    pub fn pause(env: Env, caller: Address) -> Result<(), GovernanceError> {
+        caller.require_auth();
+        let mut config = Self::get_config(env.clone());
+        
+        if caller != config.admin && caller != config.guardian {
+            return Err(GovernanceError::Unauthorized);
+        }
+        
+        config.paused = true;
+        env.storage().instance().set(&DataKey::Config, &config);
+        
+        env.events().publish(
+            (Symbol::new(&env, "contract_paused"), caller.clone()),
+            ContractPaused { caller },
+        );
+        Ok(())
+    }
+
+    /// Unpause the contract. Only admin can unpause.
+    pub fn unpause(env: Env) -> Result<(), GovernanceError> {
+        let mut config = Self::get_config(env.clone());
+        config.admin.require_auth();
+        
+        config.paused = false;
+        env.storage().instance().set(&DataKey::Config, &config);
+        
+        env.events().publish(
+            (Symbol::new(&env, "contract_unpaused"), config.admin.clone()),
+            ContractUnpaused { caller: config.admin },
+        );
+        Ok(())
+    }
+
+    /// Extend the TTL of a proposal without modifying it.
+    /// Anyone can pay to keep a proposal alive.
+    pub fn extend_proposal_ttl(env: Env, proposal_id: u64) -> Result<(), GovernanceError> {
+        // Verify the proposal exists
+        let _proposal: Proposal = env.storage().persistent()
+            .get(&DataKey::Proposal(proposal_id)).ok_or(GovernanceError::ProposalNotFound)?;
+        
+        Self::touch_proposal(&env, proposal_id);
+        Ok(())
+    }
+
+    /// Returns the voting power an address would vote with on a given proposal.
+    /// Returns the voter's balance at the proposal's snapshot ledger.
+    pub fn get_voting_power(env: Env, proposal_id: u64, voter: Address) -> Result<i128, GovernanceError> {
+        let proposal: Proposal = env.storage().persistent()
+            .get(&DataKey::Proposal(proposal_id)).ok_or(GovernanceError::ProposalNotFound)?;
+        
+        let config: Config = env.storage().instance().get(&DataKey::Config).unwrap();
+        let voting_power = TokenClient::new(&env, &config.token)
+            .get_past_balance(&voter, &proposal.snapshot_ledger);
+        
+        Ok(voting_power)
+    }
+
+    /// Mark a queued proposal as expired if it's past the execution grace period.
+    /// Anyone can call this to update the status of an expired proposal.
+    pub fn mark_expired(env: Env, proposal_id: u64) -> Result<(), GovernanceError> {
+        let mut proposal: Proposal = env.storage().persistent()
+            .get(&DataKey::Proposal(proposal_id)).ok_or(GovernanceError::ProposalNotFound)?;
+        
+        if proposal.status != ProposalStatus::Queued {
+            return Err(GovernanceError::ProposalNotPassed);
+        }
+        
+        let config: Config = env.storage().instance().get(&DataKey::Config).unwrap();
+        let execution_deadline = proposal.queue_ledger + config.execution_grace_period;
+        
+        if config.execution_grace_period > 0 && env.ledger().sequence() > execution_deadline {
+            proposal.status = ProposalStatus::Expired;
+            env.storage().persistent().set(&DataKey::Proposal(proposal_id), &proposal);
+            Self::touch_proposal(&env, proposal_id);
+            Ok(())
+        } else {
+            Err(GovernanceError::TimelockNotExpired)
+        }
+    }
 }
 /// Internal helpers — outside `#[contractimpl]` so they are not exported as
 /// contract functions.
 impl GovernanceContract {
+    /// Returns the config if initialized, otherwise returns NotInitialized error.
+    fn require_config(env: &Env) -> Result<Config, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(GovernanceError::NotInitialized)
+    }
+
     /// Quorum threshold for a given circulating supply: `supply * bps / 10000`.
     ///
     /// Integer division truncates, so the threshold is never rounded up beyond

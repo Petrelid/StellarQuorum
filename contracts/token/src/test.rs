@@ -5,6 +5,7 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
+use soroban_sdk::testutils::storage::Persistent as _;
 use soroban_sdk::{IntoVal, TryFromVal, Val};
 
 const INITIAL_SUPPLY: i128 = 1_000_000;
@@ -42,6 +43,59 @@ fn initialize_sets_metadata_supply_and_admin_balance() {
 }
 
 #[test]
+fn initialize_accepts_zero_supply_for_later_minting() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let token_id = env.register(QuorumToken, ());
+    let token = QuorumTokenClient::new(&env, &token_id);
+
+    token.initialize(
+        &admin,
+        &String::from_str(&env, "Quorum"),
+        &String::from_str(&env, "QUORUM"),
+        &18,
+        &0,
+    );
+
+    assert_eq!(token.total_supply(), 0);
+    assert_eq!(token.balance(&admin), 0);
+}
+
+#[test]
+fn initialize_rejects_negative_supply_and_decimals_above_eighteen() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let negative_id = env.register(QuorumToken, ());
+    let negative = QuorumTokenClient::new(&env, &negative_id);
+
+    assert_eq!(
+        negative.try_initialize(
+            &admin,
+            &String::from_str(&env, "Quorum"),
+            &String::from_str(&env, "QUORUM"),
+            &7,
+            &-1,
+        ),
+        Err(Ok(TokenError::InvalidSupply))
+    );
+
+    let decimals_id = env.register(QuorumToken, ());
+    let decimals = QuorumTokenClient::new(&env, &decimals_id);
+    assert_eq!(
+        decimals.try_initialize(
+            &admin,
+            &String::from_str(&env, "Quorum"),
+            &String::from_str(&env, "QUORUM"),
+            &19,
+            &0,
+        ),
+        Err(Ok(TokenError::InvalidDecimals))
+    );
+}
+
+#[test]
 fn initialize_cannot_run_twice() {
     let env = Env::default();
     let (admin, token) = deploy(&env);
@@ -67,6 +121,16 @@ fn balance_of_an_unknown_address_is_zero() {
     let (_, token) = deploy(&env);
 
     assert_eq!(token.balance(&Address::generate(&env)), 0);
+}
+
+#[test]
+fn spendable_balance_matches_balance() {
+    let env = Env::default();
+    let (admin, token) = deploy(&env);
+    let holder = Address::generate(&env);
+    token.transfer(&admin, &holder, &12_345);
+
+    assert_eq!(token.spendable_balance(&holder), token.balance(&holder));
 }
 
 // ─── Transfer ────────────────────────────────────────────────────────────────
@@ -326,6 +390,64 @@ fn burn_lowers_the_holder_balance_and_total_supply() {
 }
 
 #[test]
+fn burn_from_spends_allowance_and_emits_owner_burn_event() {
+    let env = Env::default();
+    let (admin, token) = deploy(&env);
+    let spender = Address::generate(&env);
+    token.approve(&admin, &spender, &50_000, &FAR_FUTURE);
+
+    token.burn_from(&spender, &admin, &20_000);
+
+    let (topics, data) = last_event(&env);
+
+    assert_eq!(token.balance(&admin), INITIAL_SUPPLY - 20_000);
+    assert_eq!(token.total_supply(), INITIAL_SUPPLY - 20_000);
+    assert_eq!(token.allowance(&admin, &spender), 30_000);
+
+    assert_eq!(
+        topics,
+        (Symbol::new(&env, "burn"), admin.clone()).into_val(&env)
+    );
+    assert_eq!(
+        Burn::try_from_val(&env, &data).unwrap(),
+        Burn { from: admin, amount: 20_000, total_supply: INITIAL_SUPPLY - 20_000 }
+    );
+}
+
+#[test]
+fn burn_from_rejects_insufficient_allowance_without_changes() {
+    let env = Env::default();
+    let (admin, token) = deploy(&env);
+    let spender = Address::generate(&env);
+    token.approve(&admin, &spender, &10_000, &FAR_FUTURE);
+
+    assert_eq!(
+        token.try_burn_from(&spender, &admin, &10_001),
+        Err(Ok(TokenError::InsufficientAllowance))
+    );
+    assert_eq!(token.balance(&admin), INITIAL_SUPPLY);
+    assert_eq!(token.total_supply(), INITIAL_SUPPLY);
+    assert_eq!(token.allowance(&admin, &spender), 10_000);
+}
+
+#[test]
+fn burn_from_rejects_an_expired_allowance() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(100);
+    let (admin, token) = deploy(&env);
+    let spender = Address::generate(&env);
+    token.approve(&admin, &spender, &50_000, &200);
+
+    env.ledger().set_sequence_number(201);
+    assert_eq!(
+        token.try_burn_from(&spender, &admin, &1_000),
+        Err(Ok(TokenError::InsufficientAllowance))
+    );
+    assert_eq!(token.balance(&admin), INITIAL_SUPPLY);
+    assert_eq!(token.total_supply(), INITIAL_SUPPLY);
+}
+
+#[test]
 fn burn_beyond_balance_is_rejected() {
     let env = Env::default();
     let (admin, token) = deploy(&env);
@@ -351,6 +473,63 @@ fn burn_of_the_entire_balance_is_allowed() {
 
     assert_eq!(token.balance(&holder), 0);
     assert_eq!(token.total_supply(), INITIAL_SUPPLY - 1_000);
+fn mint_that_would_overflow_total_supply_returns_overflow() {
+    let env = Env::default();
+    let (admin, token) = deploy(&env);
+
+    // One more than the headroom left above the current supply.
+    assert_eq!(
+        token.try_mint(&admin, &(i128::MAX - INITIAL_SUPPLY + 1)),
+        Err(Ok(TokenError::Overflow))
+    );
+    // A rejected mint changes nothing.
+    assert_eq!(token.total_supply(), INITIAL_SUPPLY);
+    assert_eq!(token.balance(&admin), INITIAL_SUPPLY);
+}
+
+#[test]
+fn mint_up_to_the_exact_supply_ceiling_succeeds_and_the_next_unit_overflows() {
+    let env = Env::default();
+    let (admin, token) = deploy(&env);
+
+    token.mint(&admin, &(i128::MAX - INITIAL_SUPPLY));
+    assert_eq!(token.total_supply(), i128::MAX);
+
+    assert_eq!(token.try_mint(&admin, &1), Err(Ok(TokenError::Overflow)));
+    assert_eq!(token.total_supply(), i128::MAX);
+}
+
+#[test]
+fn burning_the_entire_supply_leaves_zero() {
+    let env = Env::default();
+    let (admin, token) = deploy(&env);
+
+    token.burn(&admin, &INITIAL_SUPPLY);
+
+    assert_eq!(token.total_supply(), 0);
+    assert_eq!(token.balance(&admin), 0);
+}
+
+#[test]
+fn burn_cannot_take_total_supply_below_zero() {
+    let env = Env::default();
+    let (admin, token) = deploy(&env);
+
+    // Normal operation keeps supply >= every balance, so corrupt the ledger
+    // directly to prove the guard holds if that invariant is ever broken.
+    env.as_contract(&token.address, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalSupply, &(INITIAL_SUPPLY - 1));
+    });
+
+    assert_eq!(
+        token.try_burn(&admin, &INITIAL_SUPPLY),
+        Err(Ok(TokenError::Overflow))
+    );
+    // The refused burn did not touch the holder or the supply.
+    assert_eq!(token.balance(&admin), INITIAL_SUPPLY);
+    assert_eq!(token.total_supply(), INITIAL_SUPPLY - 1);
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────
@@ -486,6 +665,8 @@ fn transfer_admin_emits_both_sides_of_the_handover() {
     let new_admin = Address::generate(&env);
 
     token.transfer_admin(&new_admin);
+    env.mock_all_auths();
+    token.accept_admin();
 
     let (topics, data) = last_event(&env);
     assert_eq!(
@@ -745,12 +926,13 @@ fn a_negative_approval_is_rejected() {
 #[test]
 fn transfer_admin_hands_minting_rights_to_the_new_admin() {
     let env = Env::default();
-    let (_, token) = deploy(&env);
+    let (_admin, token) = deploy(&env);
     let new_admin = Address::generate(&env);
 
     token.transfer_admin(&new_admin);
+    env.mock_all_auths();
+    token.accept_admin();
 
-    // The rights moved: the new admin can mint.
     token.mint(&new_admin, &1_000);
     assert_eq!(token.balance(&new_admin), 1_000);
 }
@@ -915,6 +1097,102 @@ fn binary_search_resolves_the_correct_entry_across_many_checkpoints() {
     assert_eq!(token.get_past_balance(&holder, &10_000), 20_000);
 }
 
+// ─── Supply checkpoints ──────────────────────────────────────────────────────
+
+#[test]
+fn initial_supply_is_checkpointed() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (_admin, token) = deploy(&env);
+
+    assert_eq!(token.get_past_total_supply(&9), 0);
+    assert_eq!(token.get_past_total_supply(&10), INITIAL_SUPPLY);
+    assert_eq!(token.get_past_total_supply(&1_000), INITIAL_SUPPLY);
+}
+
+#[test]
+fn mint_and_burn_checkpoint_total_supply() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (admin, token) = deploy(&env);
+
+    env.ledger().set_sequence_number(30);
+    token.mint(&admin, &500_000);
+    env.ledger().set_sequence_number(40);
+    token.burn(&admin, &200_000);
+
+    assert_eq!(token.get_past_total_supply(&29), INITIAL_SUPPLY);
+    assert_eq!(token.get_past_total_supply(&30), 1_500_000);
+    assert_eq!(token.get_past_total_supply(&39), 1_500_000);
+    assert_eq!(token.get_past_total_supply(&40), 1_300_000);
+    assert_eq!(token.get_past_total_supply(&40), token.total_supply());
+}
+
+#[test]
+fn transfers_do_not_move_past_total_supply() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (admin, token) = deploy(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_sequence_number(20);
+    token.transfer(&admin, &recipient, &400_000);
+
+    assert_eq!(token.get_past_total_supply(&20), INITIAL_SUPPLY);
+}
+
+#[test]
+fn supply_changes_in_one_ledger_collapse_to_the_closing_supply() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (admin, token) = deploy(&env);
+
+    env.ledger().set_sequence_number(20);
+    token.mint(&admin, &100_000);
+    token.burn(&admin, &30_000);
+    token.mint(&admin, &5_000);
+
+    assert_eq!(token.get_past_total_supply(&20), 1_075_000);
+    assert_eq!(token.get_past_total_supply(&19), INITIAL_SUPPLY);
+}
+
+#[test]
+fn a_refused_mint_writes_no_supply_checkpoint() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (admin, token) = deploy(&env);
+
+    env.ledger().set_sequence_number(20);
+    assert_eq!(
+        token.try_mint(&admin, &i128::MAX),
+        Err(Ok(TokenError::Overflow))
+    );
+    assert_eq!(token.get_past_total_supply(&20), INITIAL_SUPPLY);
+}
+
+#[test]
+fn supply_history_is_kept_past_the_balance_retention_window() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(1);
+    let (admin, token) = deploy(&env);
+
+    env.ledger().set_sequence_number(100);
+    token.mint(&admin, &1);
+    env.ledger().set_sequence_number(200);
+    token.mint(&admin, &1);
+
+    // Far enough on that balance checkpoints from ledgers 1–200 would prune,
+    // but inside the TTL that the mints above extended instance storage to.
+    let later = 200 + CHECKPOINT_RETENTION + 10;
+    env.ledger().set_sequence_number(later);
+    token.mint(&admin, &1);
+
+    assert_eq!(token.get_past_total_supply(&1), INITIAL_SUPPLY);
+    assert_eq!(token.get_past_total_supply(&100), INITIAL_SUPPLY + 1);
+    assert_eq!(token.get_past_total_supply(&200), INITIAL_SUPPLY + 2);
+    assert_eq!(token.get_past_total_supply(&later), INITIAL_SUPPLY + 3);
+}
+
 // ─── Property test: binary search vs. naive linear scan (#161) ───────────────
 
 /// Minimal, dependency-free xorshift32 PRNG. Deterministic (fixed seed) so
@@ -1028,4 +1306,167 @@ fn get_past_balance_with_single_checkpoint() {
     assert_eq!(token.get_past_balance(&holder, &50), 777);
     assert_eq!(token.get_past_balance(&holder, &51), 777);
     assert_eq!(token.get_past_balance(&holder, &1_000), 777);
+}
+
+// ─── Storage lifetime ────────────────────────────────────────────────────────
+
+/// Remaining TTL, in ledgers, of a persistent token entry.
+fn entry_ttl(env: &Env, token_id: &Address, key: &DataKey) -> u32 {
+    env.as_contract(token_id, || env.storage().persistent().get_ttl(key))
+}
+
+/// Number of checkpoints currently stored for `owner`.
+fn checkpoint_count(env: &Env, token_id: &Address, owner: &Address) -> u32 {
+    env.as_contract(token_id, || QuorumToken::checkpoints(env, owner).len())
+}
+
+#[test]
+fn balances_checkpoints_and_allowances_start_past_the_ttl_threshold() {
+    let env = Env::default();
+    let (admin, token) = deploy(&env);
+    let spender = Address::generate(&env);
+    token.approve(&admin, &spender, &100, &FAR_FUTURE);
+
+    assert!(entry_ttl(&env, &token.address, &DataKey::Balance(admin.clone())) >= TTL_THRESHOLD);
+    assert!(entry_ttl(&env, &token.address, &DataKey::Checkpoints(admin.clone())) >= TTL_THRESHOLD);
+    assert!(entry_ttl(&env, &token.address, &DataKey::Allowance(admin, spender)) >= TTL_THRESHOLD);
+}
+
+#[test]
+fn reading_an_aged_balance_and_checkpoints_extends_their_ttl() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (admin, token) = deploy(&env);
+    let holder = Address::generate(&env);
+    token.transfer(&admin, &holder, &5_000);
+
+    // Let most of the entries' life burn off, then read them.
+    env.ledger().set_sequence_number(10 + TTL_EXTEND_TO - 1_000);
+    let balance_key = DataKey::Balance(holder.clone());
+    let checkpoints_key = DataKey::Checkpoints(holder.clone());
+    let balance_before = entry_ttl(&env, &token.address, &balance_key);
+    let checkpoints_before = entry_ttl(&env, &token.address, &checkpoints_key);
+
+    token.balance(&holder);
+    token.get_past_balance(&holder, &10);
+
+    assert!(balance_before < TTL_THRESHOLD, "entry should have aged below the threshold");
+    assert!(checkpoints_before < TTL_THRESHOLD, "entry should have aged below the threshold");
+    assert!(entry_ttl(&env, &token.address, &balance_key) >= TTL_THRESHOLD);
+    assert!(entry_ttl(&env, &token.address, &checkpoints_key) >= TTL_THRESHOLD);
+}
+
+#[test]
+fn an_inactive_holder_keeps_their_voting_power_across_a_long_voting_window() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (admin, token) = deploy(&env);
+    let holder = Address::generate(&env);
+    token.transfer(&admin, &holder, &5_000);
+
+    // Well past the default entry lifetime and the 30-day voting period, with
+    // nothing touching the holder's entries in between.
+    env.ledger()
+        .set_sequence_number(10 + LEDGERS_PER_DAY * 45);
+
+    assert_eq!(token.get_past_balance(&holder, &10), 5_000);
+    assert_eq!(token.balance(&holder), 5_000);
+    // Instance storage carries the admin, metadata and supply.
+    assert_eq!(token.total_supply(), INITIAL_SUPPLY);
+    assert_eq!(token.symbol(), String::from_str(&env, "QUORUM"));
+}
+
+#[test]
+fn a_live_allowance_outlives_a_long_idle_period() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (admin, token) = deploy(&env);
+    let spender = Address::generate(&env);
+    token.approve(&admin, &spender, &700, &(10 + LEDGERS_PER_DAY * 60));
+
+    env.ledger()
+        .set_sequence_number(10 + LEDGERS_PER_DAY * 45);
+
+    assert_eq!(token.allowance(&admin, &spender), 700);
+}
+
+// ─── Checkpoint growth ───────────────────────────────────────────────────────
+
+#[test]
+fn checkpoints_inside_the_retention_window_are_all_kept() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(1);
+    let (admin, token) = deploy(&env);
+    let holder = Address::generate(&env);
+
+    for step in 1..=5u32 {
+        env.ledger().set_sequence_number(step * 10);
+        token.transfer(&admin, &holder, &10);
+    }
+
+    assert_eq!(checkpoint_count(&env, &token.address, &holder), 5);
+    assert_eq!(token.get_past_balance(&holder, &10), 10);
+    assert_eq!(token.get_past_balance(&holder, &50), 50);
+}
+
+#[test]
+fn checkpoints_older_than_the_retention_window_are_pruned_but_the_cutoff_balance_survives() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(1);
+    let (admin, token) = deploy(&env);
+    let holder = Address::generate(&env);
+
+    // Six transfers of 10, roughly 17 days apart: balances 10, 20, ... 60.
+    let step_ledgers = 300_000u32;
+    let mut ledgers = std::vec::Vec::new();
+    for step in 0..6u32 {
+        let ledger = if step == 0 { 1 } else { step * step_ledgers };
+        env.ledger().set_sequence_number(ledger);
+        token.transfer(&admin, &holder, &10);
+        ledgers.push(ledger);
+    }
+    let last = *ledgers.last().unwrap();
+    let cutoff = last - CHECKPOINT_RETENTION;
+
+    // Ledgers 1 and 300_000 fall before the cutoff; only the newer of the two
+    // is kept, as the balance in effect at the cutoff.
+    assert!(ledgers[0] < cutoff && ledgers[1] < cutoff && ledgers[2] >= cutoff);
+    assert_eq!(checkpoint_count(&env, &token.address, &holder), 5);
+
+    // The balance in effect at the cutoff, and everything after, still resolves.
+    assert_eq!(token.get_past_balance(&holder, &cutoff), 20);
+    assert_eq!(token.get_past_balance(&holder, &ledgers[3]), 40);
+    assert_eq!(token.get_past_balance(&holder, &last), 60);
+    assert_eq!(token.balance(&holder), 60);
+}
+
+#[test]
+fn history_just_past_the_window_keeps_one_anchor_and_the_new_entry() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(1);
+    let (admin, token) = deploy(&env);
+    let holder = Address::generate(&env);
+    token.transfer(&admin, &holder, &10);
+
+    // Just past the retention window (and still inside the entry TTL): the old
+    // entry is the only stale one, so it is kept as the anchor, and the new
+    // entry is current. Two remain rather than the history growing unbounded.
+    let later = 1 + CHECKPOINT_RETENTION + 10;
+    env.ledger().set_sequence_number(later);
+    token.transfer(&admin, &holder, &10);
+
+    assert_eq!(checkpoint_count(&env, &token.address, &holder), 2);
+    assert_eq!(token.get_past_balance(&holder, &later), 20);
+    assert_eq!(token.get_past_balance(&holder, &(later - 1)), 10);
+}
+
+#[test]
+fn cancel_admin_transfer_stops_handover() {
+    let env = Env::default();
+    let (_admin, token) = deploy(&env);
+    let new_admin = Address::generate(&env);
+
+    token.transfer_admin(&new_admin);
+    token.cancel_admin_transfer();
+    assert!(token.try_accept_admin().is_err());
 }

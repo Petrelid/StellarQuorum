@@ -33,10 +33,33 @@ export interface QuorumClientConfig {
   rpcUrl: string;
   networkPassphrase: string;
   governanceContractId: string;
-  tokenContractId: string;
+  tokenContractId?: string;
+  requestTimeoutMs?: number;
+  readRetryAttempts?: number;
+  retryBaseDelayMs?: number;
+  retryJitterMs?: number;
+  pollIntervalMs?: number;
+  confirmationTimeoutMs?: number;
+}
+
+export interface TransactionConfirmationOptions {
+  pollIntervalMs?: number;
+  timeoutMs?: number;
 }
 
 export interface NetworkConfig {
   rpcUrl: string;
   networkPassphrase: string;
+}
+
+/**
+ * Pagination window for proposal listing (issue #118).
+ *
+ * `offset` is the number of oldest proposals to skip (0-based), `limit` is
+ * the maximum number of proposals to return. When omitted, callers that pass
+ * no options get the historical behaviour (all proposals).
+ */
+export interface GetProposalsOptions {
+  limit?: number;
+  offset?: number;
 }

@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 //! QUORUM — governance token for the Quorum protocol. SEP-41 compatible.
 use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, Env, String, Symbol, Vec};
 
@@ -13,6 +13,8 @@ pub enum TokenError {
     InvalidAmount         = 5,
     Overflow              = 6,
     InvalidExpiration     = 7,
+    InvalidSupply         = 8,
+    InvalidDecimals       = 9,
 }
 
 /// A balance recorded at the ledger on which it changed.
@@ -22,6 +24,9 @@ pub enum TokenError {
 /// of that ledger rather than the live balance. Tokens acquired after the
 /// snapshot therefore carry no weight, which is what blocks flash-loan and
 /// buy-the-vote attacks.
+///
+/// The same shape records total supply under `SupplyCheckpoints`, where
+/// `balance` is the supply after the ledger's last mint or burn.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Checkpoint {
@@ -91,7 +96,34 @@ pub enum DataKey {
     Balance(Address),
     Allowance(Address, Address),
     Checkpoints(Address),
+    PendingAdmin,
+    SupplyCheckpoints,
 }
+
+/// Ledgers in roughly one day, at Stellar's ~5 second close time.
+const LEDGERS_PER_DAY: u32 = 17_280;
+
+/// Bump persistent entries whose remaining life has fallen below 30 days.
+///
+/// Snapshot voting power is read from `Checkpoints`, and an entry that expired
+/// mid-vote would make `get_past_balance` return 0 for that holder. The
+/// governance create form offers voting periods up to 30 days, so the threshold
+/// has to exceed that. Matches the governance contract.
+const TTL_THRESHOLD: u32 = LEDGERS_PER_DAY * 30;
+
+/// Extend qualifying entries back out to 90 days.
+const TTL_EXTEND_TO: u32 = LEDGERS_PER_DAY * 90;
+
+/// How far back checkpoints are kept, in ledgers (60 days).
+///
+/// A snapshot is only ever read while its proposal is voting, so history older
+/// than the longest voting period is dead weight that costs rent and slows
+/// every `get_past_balance`. This is twice the 30-day maximum the create form
+/// offers. If governance is configured with a longer `voting_period`, raise it.
+const CHECKPOINT_RETENTION: u32 = LEDGERS_PER_DAY * 60;
+
+/// Maximum precision supported by the token's public formatting contract.
+const MAX_DECIMALS: u32 = 18;
 
 #[contract]
 pub struct QuorumToken;
@@ -100,12 +132,14 @@ pub struct QuorumToken;
 impl QuorumToken {
     pub fn initialize(env: Env, admin: Address, name: String, symbol: String, decimals: u32, initial_supply: i128) -> Result<(), TokenError> {
         if env.storage().instance().has(&DataKey::Admin) { return Err(TokenError::AlreadyInitialized); }
+        if initial_supply < 0 { return Err(TokenError::InvalidSupply); }
+        if decimals > MAX_DECIMALS { return Err(TokenError::InvalidDecimals); }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Name, &name);
         env.storage().instance().set(&DataKey::Symbol, &symbol);
         env.storage().instance().set(&DataKey::Decimals, &decimals);
-        env.storage().instance().set(&DataKey::TotalSupply, &initial_supply);
+        Self::set_total_supply(&env, initial_supply);
         Self::set_balance(&env, &admin, initial_supply);
 
         // The genesis allocation is a mint. Emitting it keeps supply
@@ -117,38 +151,55 @@ impl QuorumToken {
         Ok(())
     }
 
+    pub fn version(env: Env) -> String {
+        String::from_str(&env, env!("CARGO_PKG_VERSION"))
+    }
+
     /// Balance of `owner` as of the end of `ledger`.
     ///
     /// Returns the most recent checkpoint at or before `ledger`, or 0 if the
     /// address held nothing that far back. Governance reads voting power
     /// through this, using a proposal's `snapshot_ledger`.
     pub fn get_past_balance(env: Env, owner: Address, ledger: u32) -> i128 {
-        let checkpoints = Self::checkpoints(&env, &owner);
+        Self::touch_instance(&env);
+        Self::value_at(&Self::checkpoints(&env, &owner), ledger)
+    }
 
-        // Binary search for the first checkpoint recorded after `ledger`; the
-        // balance in effect is the one immediately before it.
-        let mut low = 0u32;
-        let mut high = checkpoints.len();
-        while low < high {
-            let mid = low + (high - low) / 2;
-            match checkpoints.get(mid) {
-                Some(checkpoint) if checkpoint.ledger <= ledger => low = mid + 1,
-                _ => high = mid,
-            }
-        }
-
-        if low == 0 {
-            0
-        } else {
-            checkpoints.get(low - 1).map(|c| c.balance).unwrap_or(0)
-        }
+    /// Total supply as of the end of `ledger`.
+    ///
+    /// Governance freezes `quorum_required` from the live supply when a
+    /// proposal is created; this lets anyone recompute that figure later from
+    /// the proposal's `snapshot_ledger`. Supply history is never pruned, so
+    /// the answer stays available after the proposal closes. Returns 0 for a
+    /// ledger before `initialize`.
+    ///
+    /// The value is the supply at the close of `ledger`. A mint or burn later
+    /// in the same ledger as a proposal's creation is included here but was
+    /// not in the live figure the proposal saw.
+    pub fn get_past_total_supply(env: Env, ledger: u32) -> i128 {
+        Self::touch_instance(&env);
+        Self::value_at(&Self::supply_checkpoints(&env), ledger)
     }
 
     pub fn balance(env: Env, owner: Address) -> i128 {
-        env.storage().persistent().get(&DataKey::Balance(owner)).unwrap_or(0)
+        let key = DataKey::Balance(owner);
+        match env.storage().persistent().get(&key) {
+            Some(balance) => {
+                Self::touch(&env, &key);
+                balance
+            }
+            None => 0,
+        }
+    }
+
+    /// Balance available to spend. This token has no locked-balance model, so
+    /// the spendable balance is the same as the current balance.
+    pub fn spendable_balance(env: Env, owner: Address) -> i128 {
+        Self::balance(env, owner)
     }
 
     pub fn total_supply(env: Env) -> i128 {
+        Self::touch_instance(&env);
         env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0)
     }
 
@@ -180,12 +231,55 @@ impl QuorumToken {
 
         // Debiting keeps the original expiry — spending part of an allowance
         // must not extend the remainder's life.
+        let key = DataKey::Allowance(from, spender);
         env.storage().persistent().set(
-            &DataKey::Allowance(from, spender),
+            &key,
             &AllowanceValue {
                 amount: approval.amount - amount,
                 expiration_ledger: approval.expiration_ledger,
             },
+        );
+        Self::touch(&env, &key);
+        Ok(())
+    }
+
+    /// Burns `amount` from `from` on behalf of `spender`, drawing on an
+    /// allowance the owner granted with `approve`.
+    ///
+    /// The burn event names the owner whose balance and supply were reduced;
+    /// the spender is only the authorizer.
+    pub fn burn_from(env: Env, spender: Address, from: Address, amount: i128) -> Result<(), TokenError> {
+        spender.require_auth();
+        if amount <= 0 { return Err(TokenError::InvalidAmount); }
+
+        let approval = Self::live_allowance(&env, &from, &spender);
+        if approval.amount < amount { return Err(TokenError::InsufficientAllowance); }
+
+        let bal = Self::balance(env.clone(), from.clone());
+        if bal < amount { return Err(TokenError::InsufficientBalance); }
+        let supply = Self::total_supply(env.clone());
+        let total_supply = supply
+            .checked_sub(amount)
+            .filter(|remaining| *remaining >= 0)
+            .ok_or(TokenError::Overflow)?;
+
+        // Complete all validation before mutating the balance or allowance.
+        Self::set_balance(&env, &from, bal - amount);
+        env.storage().instance().set(&DataKey::TotalSupply, &total_supply);
+
+        let key = DataKey::Allowance(from.clone(), spender);
+        env.storage().persistent().set(
+            &key,
+            &AllowanceValue {
+                amount: approval.amount - amount,
+                expiration_ledger: approval.expiration_ledger,
+            },
+        );
+        Self::touch(&env, &key);
+
+        env.events().publish(
+            (Symbol::new(&env, "burn"), from.clone()),
+            Burn { from, amount, total_supply },
         );
         Ok(())
     }
@@ -194,11 +288,14 @@ impl QuorumToken {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         if amount <= 0 { return Err(TokenError::InvalidAmount); }
+        // Checked, so an overflowing mint returns `Overflow` instead of
+        // trapping. Both sums are computed before anything is written.
         let supply: i128 = Self::total_supply(env.clone());
-        let total_supply = supply + amount;
-        env.storage().instance().set(&DataKey::TotalSupply, &total_supply);
+        let total_supply = supply.checked_add(amount).ok_or(TokenError::Overflow)?;
         let bal = Self::balance(env.clone(), to.clone());
-        Self::set_balance(&env, &to, bal + amount);
+        let new_balance = bal.checked_add(amount).ok_or(TokenError::Overflow)?;
+        Self::set_total_supply(&env, total_supply);
+        Self::set_balance(&env, &to, new_balance);
 
         env.events().publish(
             (Symbol::new(&env, "mint"), to.clone()),
@@ -212,10 +309,16 @@ impl QuorumToken {
         if amount <= 0 { return Err(TokenError::InvalidAmount); }
         let bal = Self::balance(env.clone(), from.clone());
         if bal < amount { return Err(TokenError::InsufficientBalance); }
-        Self::set_balance(&env, &from, bal - amount);
+        // Supply can only be below a holder's balance if storage is
+        // inconsistent; refuse rather than underflow it. Checked before any
+        // write so a refused burn changes nothing.
         let supply = Self::total_supply(env.clone());
-        let total_supply = supply - amount;
-        env.storage().instance().set(&DataKey::TotalSupply, &total_supply);
+        let total_supply = supply
+            .checked_sub(amount)
+            .filter(|remaining| *remaining >= 0)
+            .ok_or(TokenError::Overflow)?;
+        Self::set_balance(&env, &from, bal - amount);
+        Self::set_total_supply(&env, total_supply);
 
         env.events().publish(
             (Symbol::new(&env, "burn"), from.clone()),
@@ -237,10 +340,11 @@ impl QuorumToken {
             return Err(TokenError::InvalidExpiration);
         }
 
-        env.storage().persistent().set(
-            &DataKey::Allowance(owner.clone(), spender.clone()),
-            &AllowanceValue { amount, expiration_ledger },
-        );
+        let key = DataKey::Allowance(owner.clone(), spender.clone());
+        env.storage()
+            .persistent()
+            .set(&key, &AllowanceValue { amount, expiration_ledger });
+        Self::touch(&env, &key);
 
         env.events().publish(
             (Symbol::new(&env, "approve"), owner.clone(), spender.clone()),
@@ -261,12 +365,29 @@ impl QuorumToken {
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), TokenError> {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        Ok(())
+    }
+
+    pub fn accept_admin(env: Env) -> Result<(), TokenError> {
+        let pending: Address = env.storage().instance().get(&DataKey::PendingAdmin)
+            .ok_or(TokenError::Unauthorized)?;
+        pending.require_auth();
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        env.storage().instance().set(&DataKey::Admin, &pending);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
 
         env.events().publish(
             (Symbol::new(&env, "admin_transferred"), admin.clone()),
-            AdminTransferred { previous_admin: admin, new_admin },
+            AdminTransferred { previous_admin: admin, new_admin: pending },
         );
+        Ok(())
+    }
+
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), TokenError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().instance().remove(&DataKey::PendingAdmin);
         Ok(())
     }
 
@@ -286,14 +407,30 @@ impl QuorumToken {
     /// Returning a zeroed value rather than `None` keeps the expiry check in
     /// one place: every spender path treats a lapsed approval as empty.
     fn live_allowance(env: &Env, owner: &Address, spender: &Address) -> AllowanceValue {
-        match env
-            .storage()
-            .persistent()
-            .get::<_, AllowanceValue>(&DataKey::Allowance(owner.clone(), spender.clone()))
-        {
-            Some(allowance) if allowance.expiration_ledger >= env.ledger().sequence() => allowance,
+        let key = DataKey::Allowance(owner.clone(), spender.clone());
+        match env.storage().persistent().get::<_, AllowanceValue>(&key) {
+            Some(allowance) if allowance.expiration_ledger >= env.ledger().sequence() => {
+                Self::touch(env, &key);
+                allowance
+            }
             _ => AllowanceValue { amount: 0, expiration_ledger: 0 },
         }
+    }
+
+    /// Extends the TTL of a persistent entry that is known to exist, so
+    /// balances, checkpoints and live allowances outlast long voting windows.
+    fn touch(env: &Env, key: &DataKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Extends the TTL of instance storage, which holds the admin, metadata and
+    /// total supply. If this expired the contract would lose its configuration.
+    fn touch_instance(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
     }
 
     /// Debits `from`, credits `to`, and emits the transfer event.
@@ -320,10 +457,14 @@ impl QuorumToken {
     }
 
     fn checkpoints(env: &Env, owner: &Address) -> Vec<Checkpoint> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Checkpoints(owner.clone()))
-            .unwrap_or_else(|| Vec::new(env))
+        let key = DataKey::Checkpoints(owner.clone());
+        match env.storage().persistent().get(&key) {
+            Some(checkpoints) => {
+                Self::touch(env, &key);
+                checkpoints
+            }
+            None => Vec::new(env),
+        }
     }
 
     /// Writes `balance` for `owner` and records a checkpoint at the current
@@ -333,27 +474,103 @@ impl QuorumToken {
     /// leave a gap that `get_past_balance` would silently read straight past,
     /// handing the holder the wrong voting power.
     fn set_balance(env: &Env, owner: &Address, balance: i128) {
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(owner.clone()), &balance);
+        Self::touch_instance(env);
+        let balance_key = DataKey::Balance(owner.clone());
+        env.storage().persistent().set(&balance_key, &balance);
+        Self::touch(env, &balance_key);
 
         let ledger = env.ledger().sequence();
         let mut checkpoints = Self::checkpoints(env, owner);
-        let len = checkpoints.len();
+        Self::record(&mut checkpoints, ledger, balance);
 
-        // Several transfers can land in one ledger. Collapse them so each
-        // ledger keeps exactly one entry — its closing balance — which is what
-        // keeps the binary search in get_past_balance unambiguous.
-        match checkpoints.get(len.saturating_sub(1)) {
-            Some(last) if len > 0 && last.ledger == ledger => {
-                checkpoints.set(len - 1, Checkpoint { ledger, balance });
+        // Drop history no snapshot can still ask for. Entries older than the
+        // retention window are pruned, except the newest of them: that one is
+        // the balance in effect at the cutoff, so a snapshot taken just inside
+        // the window still resolves correctly. The entry written above is at
+        // `ledger`, never before the cutoff, so it is always kept.
+        let cutoff = ledger.saturating_sub(CHECKPOINT_RETENTION);
+        let mut stale = 0u32;
+        while stale < checkpoints.len() {
+            match checkpoints.get(stale) {
+                Some(entry) if entry.ledger < cutoff => stale += 1,
+                _ => break,
             }
-            _ => checkpoints.push_back(Checkpoint { ledger, balance }),
+        }
+        if stale > 1 {
+            checkpoints = checkpoints.slice(stale - 1..);
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Checkpoints(owner.clone()), &checkpoints);
+        let checkpoints_key = DataKey::Checkpoints(owner.clone());
+        env.storage().persistent().set(&checkpoints_key, &checkpoints);
+        Self::touch(env, &checkpoints_key);
+    }
+
+    fn supply_checkpoints(env: &Env) -> Vec<Checkpoint> {
+        let key = DataKey::SupplyCheckpoints;
+        match env.storage().persistent().get(&key) {
+            Some(checkpoints) => {
+                Self::touch(env, &key);
+                checkpoints
+            }
+            None => Vec::new(env),
+        }
+    }
+
+    /// Writes the total supply and records a supply checkpoint at the current
+    /// ledger.
+    ///
+    /// Every supply change goes through here, for the same reason balances go
+    /// through `set_balance`. Unlike balance history this is never pruned:
+    /// supply only moves on admin mints and holder burns, so it grows slowly,
+    /// and the point of keeping it is auditing quorum figures long after the
+    /// proposals that used them have closed.
+    fn set_total_supply(env: &Env, total_supply: i128) {
+        env.storage().instance().set(&DataKey::TotalSupply, &total_supply);
+
+        let mut checkpoints = Self::supply_checkpoints(env);
+        Self::record(&mut checkpoints, env.ledger().sequence(), total_supply);
+
+        let key = DataKey::SupplyCheckpoints;
+        env.storage().persistent().set(&key, &checkpoints);
+        Self::touch(env, &key);
+    }
+
+    /// Appends `value` at `ledger`, or overwrites the last entry if it is
+    /// already at `ledger`.
+    ///
+    /// Several changes can land in one ledger. Collapsing them keeps exactly
+    /// one entry per ledger — its closing value — which is what keeps the
+    /// binary search in `value_at` unambiguous.
+    fn record(checkpoints: &mut Vec<Checkpoint>, ledger: u32, value: i128) {
+        let len = checkpoints.len();
+        match checkpoints.get(len.saturating_sub(1)) {
+            Some(last) if len > 0 && last.ledger == ledger => {
+                checkpoints.set(len - 1, Checkpoint { ledger, balance: value });
+            }
+            _ => checkpoints.push_back(Checkpoint { ledger, balance: value }),
+        }
+    }
+
+    /// The value in effect at the end of `ledger`: the most recent checkpoint
+    /// at or before it, or 0 if there is none.
+    fn value_at(checkpoints: &Vec<Checkpoint>, ledger: u32) -> i128 {
+        // Binary search for the first checkpoint recorded after `ledger`; the
+        // value in effect is the one immediately before it.
+        let mut low = 0u32;
+        let mut high = checkpoints.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            match checkpoints.get(mid) {
+                Some(checkpoint) if checkpoint.ledger <= ledger => low = mid + 1,
+                _ => high = mid,
+            }
+        }
+
+        if low == 0 {
+            0
+        } else {
+            checkpoints.get(low - 1).map(|c| c.balance).unwrap_or(0)
+        }
     }
 }
 

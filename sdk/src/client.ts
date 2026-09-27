@@ -1,5 +1,6 @@
-import { SorobanRpc, Contract, TransactionBuilder, BASE_FEE, nativeToScVal, scValToNative, Address, Account, xdr } from '@stellar/stellar-sdk';
-import type { Proposal, GovernanceConfig, QuorumClientConfig, VoteSupport } from './types';
+import { rpc, Contract, TransactionBuilder, BASE_FEE, nativeToScVal, scValToNative, Address, Account, xdr } from '@stellar/stellar-sdk';
+import type { Proposal, GovernanceConfig, QuorumClientConfig, VoteSupport, GetProposalsOptions, ProposalStatus, TransactionConfirmationOptions } from './types.js';
+import { GovernanceError, parseGovernanceError, RpcTimeoutError, TransactionFailedError, contractErrorCode } from './errors.js';
 
 /**
  * Source account used for read-only simulation.
@@ -30,34 +31,144 @@ function allowsInsecureRpc(rpcUrl: string): boolean {
     hostname === '[::1]' ||
     /^127(\.\d{1,3}){3}$/.test(hostname)
   );
+ * Default page size for paginated proposal listing (issue #118).
+ *
+ * Matches the recommendation in `docs/proposal-list-performance.md`: 50 cards
+ * is one screenful, ~200 KiB per page at 4 KiB/proposal stays under public
+ * RPC response caps, with diminishing returns above 50.
+ */
+export const DEFAULT_PAGE_SIZE = 50;
+export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+export const DEFAULT_READ_RETRY_ATTEMPTS = 2;
+export const DEFAULT_RETRY_BASE_DELAY_MS = 100;
+export const DEFAULT_RETRY_JITTER_MS = 50;
+export const DEFAULT_POLL_INTERVAL_MS = 1_000;
+export const DEFAULT_CONFIRMATION_TIMEOUT_MS = 60_000;
+
+// ─── Typed governance errors (issue #115) ────────────────────────────────────
+// The contract surfaces failures as `GovernanceError` codes; a simulation
+// failure string looks like `... Error(Contract, #12) ...`. These map the
+// timelock / status paths to typed errors so callers can branch on them
+// instead of parsing strings.
+
+export class ProposalNotFoundError extends Error {
+  constructor(proposalId?: bigint | string) {
+    super(`Proposal not found${proposalId !== undefined ? `: ${String(proposalId)}` : ''}`);
+    this.name = 'ProposalNotFoundError';
+  }
+}
+
+export class VotingNotActiveError extends Error {
+  constructor(message = 'Voting window is still open; proposal cannot be finalized yet') {
+    super(message);
+    this.name = 'VotingNotActiveError';
+  }
+}
+
+export class ProposalNotPassedError extends Error {
+  constructor(message = 'Proposal is not queued and cannot be executed') {
+    super(message);
+    this.name = 'ProposalNotPassedError';
+  }
+}
+
+export class TimelockNotExpiredError extends Error {
+  constructor(message = 'Timelock has not expired; proposal cannot be executed yet') {
+    super(message);
+    this.name = 'TimelockNotExpiredError';
+  }
+}
+
+export class UnauthorizedError extends Error {
+  constructor(message = 'Caller is not authorized for this action') {
+    super(message);
+    this.name = 'UnauthorizedError';
+  }
+}
+
+function mapGovernanceSimulationError(method: string, raw: unknown): Error {
+  const message = raw instanceof Error ? raw.message : String(raw);
+  if (/#\s*3\b/.test(message) || /ProposalNotFound/.test(message)) {
+    return new ProposalNotFoundError();
+  }
+  if (/#\s*4\b/.test(message) || /VotingNotActive/.test(message)) {
+    return new VotingNotActiveError(`Simulation of ${method} failed: voting is not active (${message})`);
+  }
+  if (/#\s*7\b/.test(message) || /ProposalNotPassed/.test(message)) {
+    return new ProposalNotPassedError(`Simulation of ${method} failed: proposal has not passed (${message})`);
+  }
+  if (/#\s*12\b/.test(message) || /TimelockNotExpired/.test(message)) {
+    return new TimelockNotExpiredError(`Simulation of ${method} failed: timelock not expired (${message})`);
+  }
+  if (/#\s*2\b/.test(message) || /Unauthorized/.test(message)) {
+    return new UnauthorizedError(`Simulation of ${method} failed: unauthorized (${message})`);
+  }
+  return new Error(`Simulation of ${method} failed: ${message}`);
 }
 
 export class QuorumClient {
-  private server: SorobanRpc.Server;
+  private server: rpc.Server;
   private governance: Contract;
+  private token: Contract | null;
   private config: QuorumClientConfig;
 
   constructor(config: QuorumClientConfig) {
     this.config = config;
     this.server = new SorobanRpc.Server(config.rpcUrl, { allowHttp: allowsInsecureRpc(config.rpcUrl) });
+    this.server = new rpc.Server(config.rpcUrl, { timeout: config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS });
     this.governance = new Contract(config.governanceContractId);
+    // tokenContractId is required by the config type but older callers
+    // (e.g. bench RPC mode) only pass a governance id — stay usable and fail
+    // with a clear message only when a token method is actually used.
+    this.token = config.tokenContractId ? new Contract(config.tokenContractId) : null;
   }
 
   // ─── Read ────────────────────────────────────────────────────────────────
 
+  /** A proposal by id, or `null` if the contract reports ProposalNotFound. */
   async getProposal(id: bigint): Promise<Proposal | null> {
-    // TODO: implement via simulateTransaction → governance.get_proposal(id)
-    throw new Error('Not implemented');
+    try {
+      const raw = await this.simulate<RawProposal>('get_proposal', nativeToScVal(id, { type: 'u64' }));
+      return decodeProposal(raw);
+    } catch (error) {
+      if (parseGovernanceError(error) === GovernanceError.ProposalNotFound) return null;
+      throw error;
+    }
   }
 
   async getProposalCount(): Promise<bigint> {
-    // TODO: implement via simulateTransaction → governance.get_proposal_count()
-    throw new Error('Not implemented');
+    return BigInt(await this.simulate<bigint | number>('get_proposal_count'));
+  }
+
+  async getLatestLedger(): Promise<number> {
+    return (await this.read('getLatestLedger', () => this.server.getLatestLedger())).sequence;
+  }
+
+  async getVotingPower(voter: string, snapshotLedger: number): Promise<bigint> {
+    const token = await this.tokenContract();
+    return BigInt(await this.simulateOn<bigint | number>(token, 'get_past_balance', new Address(voter).toScVal(), nativeToScVal(snapshotLedger, { type: 'u32' })));
+  }
+
+  async getBalance(voter: string): Promise<bigint> {
+    const token = await this.tokenContract();
+    return BigInt(await this.simulateOn<bigint | number>(token, 'balance', new Address(voter).toScVal()));
+  }
+
+  async getTokenDecimals(): Promise<number> {
+    const token = await this.tokenContract();
+    return this.simulateOn<number>(token, 'decimals');
   }
 
   async getConfig(): Promise<GovernanceConfig> {
-    // TODO: implement via simulateTransaction → governance.get_config()
-    throw new Error('Not implemented');
+    const raw = await this.simulate<RawConfig>('get_config');
+    return {
+      token: raw.token,
+      quorumBps: raw.quorum_bps,
+      votingPeriod: raw.voting_period,
+      timelockPeriod: raw.timelock_period,
+      proposalThreshold: raw.proposal_threshold,
+      admin: raw.admin,
+    };
   }
 
   async hasVoted(proposalId: bigint, voter: string): Promise<boolean> {
@@ -84,20 +195,152 @@ export class QuorumClient {
     return support === null || support === undefined ? null : (support as VoteSupport);
   }
 
-  async getProposalsByStatus(status: Proposal['status']): Promise<Proposal[]> {
-    const all = await this.getAllProposals();
+  async getProposalsByStatus(status: Proposal['status'], options?: GetProposalsOptions): Promise<Proposal[]> {
+    // Filtering happens after pagination, so callers needing a complete
+    // filtered set should omit pagination (fetch all, then filter).
+    const all = await this.getAllProposals(options);
     return all.filter(p => p.status === status);
   }
 
-  async getAllProposals(): Promise<Proposal[]> {
+  /**
+   * Paginated proposal listing (issue #118).
+   *
+   * Fetches only the requested window instead of the whole list, so a list
+   * screen rendering one page costs `1 + min(limit, remaining)` RPC calls
+   * rather than `1 + N`. Defaults to the first `DEFAULT_PAGE_SIZE` proposals.
+   *
+   * Once the contract exposes a single-call paginated read
+   * (`get_proposals(start, count)` or equivalent), this is the method that
+   * should switch to it so listing N proposals costs `O(N / page)` calls;
+   * until then it fans out one `getProposal()` per id *within the window*.
+   *
+   * @param options.limit max proposals to return (default {@link DEFAULT_PAGE_SIZE}).
+   * @param options.offset number of oldest proposals to skip (default 0).
+   */
+  async getProposals(options?: GetProposalsOptions): Promise<Proposal[]> {
+    const limit = options?.limit ?? DEFAULT_PAGE_SIZE;
+    const offset = options?.offset ?? 0;
+    return this.fetchProposalWindow(offset, limit);
+  }
+
+  /**
+   * All proposals, or a single window when `limit`/`offset` are given
+   * (issue #118).
+   *
+   * Without options this keeps the historical behaviour (fetch everything).
+   * Pass `{ limit, offset }` to fetch one page: proposal ids are 1-based, so
+   * `offset: 0, limit: 50` returns ids 1..50.
+   */
+  async getAllProposals(options?: GetProposalsOptions): Promise<Proposal[]> {
+    if (!options || (options.limit === undefined && options.offset === undefined)) {
+      const count = await this.getProposalCount();
+      const proposals = await Promise.all(
+        Array.from({ length: Number(count) }, (_, i) => this.getProposal(BigInt(i + 1)))
+      );
+      return proposals.filter(Boolean) as Proposal[];
+    }
+    const offset = options.offset ?? 0;
+    // No explicit limit means "everything from offset onwards".
+    if (options.limit === undefined) {
+      const count = await this.getProposalCount();
+      const total = Number(count);
+      const remaining = Math.max(0, total - offset);
+      return this.fetchProposalWindow(offset, remaining);
+    }
+    return this.fetchProposalWindow(offset, options.limit);
+  }
+
+  private async fetchProposalWindow(offset: number, limit: number): Promise<Proposal[]> {
+    if (!Number.isInteger(offset) || offset < 0) {
+      throw new Error(`Invalid offset ${String(offset)}: must be a non-negative integer`);
+    }
+    if (!Number.isInteger(limit) || limit < 0) {
+      throw new Error(`Invalid limit ${String(limit)}: must be a non-negative integer`);
+    }
+    if (limit === 0) {
+      return [];
+    }
     const count = await this.getProposalCount();
-    const proposals = await Promise.all(
-      Array.from({ length: Number(count) }, (_, i) => this.getProposal(BigInt(i + 1)))
-    );
+    const total = Number(count);
+    if (offset >= total) {
+      return [];
+    }
+    const end = Math.min(total, offset + limit);
+    const ids: bigint[] = [];
+    // Proposal ids are 1-based; offset 0 → id 1.
+    for (let id = offset + 1; id <= end; id += 1) {
+      ids.push(BigInt(id));
+    }
+    const proposals = await Promise.all(ids.map(id => this.getProposal(id)));
     return proposals.filter(Boolean) as Proposal[];
   }
 
+  // ─── Token reads (issue #117) ────────────────────────────────────────────
+  // All reads go through the same `simulateTransaction` path as governance
+  // reads — nothing is signed or submitted, so they cost no fee.
+
+  private requireToken(): Contract {
+    if (!this.token) {
+      throw new Error('tokenContractId is not configured; cannot call token methods');
+    }
+    return this.token;
+  }
+
+  /**
+   * Live QUORUM balance of `owner`.
+   */
+  async balance(owner: string): Promise<bigint> {
+    return this.simulateToken<bigint>(
+      'balance',
+      new Address(owner).toScVal(),
+    );
+  }
+
+  /**
+   * Balance of `owner` as of the end of `ledger` (snapshot voting power).
+   */
+  async getPastBalance(owner: string, ledger: number): Promise<bigint> {
+    return this.simulateToken<bigint>(
+      'get_past_balance',
+      new Address(owner).toScVal(),
+      nativeToScVal(ledger, { type: 'u32' }),
+    );
+  }
+
+  /**
+   * Amount `spender` may still draw from `owner` (0 once expired).
+   */
+  async allowance(owner: string, spender: string): Promise<bigint> {
+    return this.simulateToken<bigint>(
+      'allowance',
+      new Address(owner).toScVal(),
+      new Address(spender).toScVal(),
+    );
+  }
+
+  /**
+   * Total QUORUM supply.
+   */
+  async totalSupply(): Promise<bigint> {
+    return this.simulateToken<bigint>('total_supply');
+  }
+
   // ─── Internals ───────────────────────────────────────────────────────────
+
+  /**
+   * The token contract, resolved on first use.
+   *
+   * `tokenContractId` is the deployment-time hint. When it is absent the
+   * governance config is the authority, so a caller that only knows the
+   * governance contract still gets correct balances.
+   */
+  private async tokenContract(): Promise<Contract> {
+    if (this.config.tokenContractId) {
+      return new Contract(this.config.tokenContractId);
+    }
+    const { token } = await this.getConfig();
+    return new Contract(token);
+  }
 
   /**
    * Calls a read-only contract method through `simulateTransaction` and decodes
@@ -107,18 +350,30 @@ export class QuorumClient {
    * account.
    */
   private async simulate<T>(method: string, ...args: xdr.ScVal[]): Promise<T> {
+    return this.simulateOn<T>(this.governance, method, ...args);
+  }
+
+  private async simulateToken<T>(method: string, ...args: xdr.ScVal[]): Promise<T> {
+    return this.simulateOn<T>(this.requireToken(), method, ...args);
+  }
+
+  private async simulateOn<T>(contract: Contract, method: string, ...args: xdr.ScVal[]): Promise<T> {
+    return this.simulateWith<T>(contract, method, ...args);
+  }
+
+  private async simulateWith<T>(contract: Contract, method: string, ...args: xdr.ScVal[]): Promise<T> {
     const source = new Account(READ_ONLY_SOURCE, '0');
     const tx = new TransactionBuilder(source, {
       fee: BASE_FEE,
       networkPassphrase: this.config.networkPassphrase,
     })
-      .addOperation(this.governance.call(method, ...args))
+      .addOperation(contract.call(method, ...args))
       .setTimeout(30)
       .build();
 
-    const simulation = await this.server.simulateTransaction(tx);
+    const simulation = await this.read(`simulate:${method}`, () => this.server.simulateTransaction(tx));
 
-    if (SorobanRpc.Api.isSimulationError(simulation)) {
+    if (rpc.Api.isSimulationError(simulation)) {
       throw new Error(`Simulation of ${method} failed: ${simulation.error}`);
     }
     if (!simulation.result) {
@@ -128,28 +383,361 @@ export class QuorumClient {
     return scValToNative(simulation.result.retval) as T;
   }
 
+  private async read<T>(operation: string, request: () => Promise<T>): Promise<T> {
+    const attempts = (this.config.readRetryAttempts ?? DEFAULT_READ_RETRY_ATTEMPTS) + 1;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        return await this.withTimeout(operation, request());
+      } catch (error) {
+        lastError = isTimeoutError(error)
+          ? new RpcTimeoutError(operation, this.config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS)
+          : error;
+        if (lastError instanceof RpcTimeoutError || !isTransientRpcError(error) || attempt === attempts - 1) throw lastError;
+        const base = this.config.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS;
+        const jitter = this.config.retryJitterMs ?? DEFAULT_RETRY_JITTER_MS;
+        await delay(base * 2 ** attempt + Math.floor(Math.random() * (jitter + 1)));
+      }
+    }
+    throw lastError;
+  }
+
+  private async withTimeout<T>(operation: string, promise: Promise<T>): Promise<T> {
+    const timeoutMs = this.config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new RpcTimeoutError(operation, timeoutMs)), timeoutMs);
+    });
+    try {
+      return await Promise.race([promise, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** Submit already-signed XDR once, then poll until the network confirms it. */
+  async submitAndWait(signedXdr: string, options?: TransactionConfirmationOptions): Promise<rpc.Api.GetSuccessfulTransactionResponse> {
+    const transaction = TransactionBuilder.fromXDR(signedXdr, this.config.networkPassphrase);
+    const submitted = await this.withTimeout('sendTransaction', this.server.sendTransaction(transaction));
+    if (submitted.status === 'ERROR') {
+      const message = formatTransactionFailure(submitted);
+      throw new TransactionFailedError(submitted.hash, message, contractErrorCode(message));
+    }
+
+    const pollIntervalMs = options?.pollIntervalMs ?? this.config.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    const timeoutMs = options?.timeoutMs ?? this.config.confirmationTimeoutMs ?? DEFAULT_CONFIRMATION_TIMEOUT_MS;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const result = await this.read('getTransaction', () => this.server.getTransaction(submitted.hash));
+      if (result.status === rpc.Api.GetTransactionStatus.SUCCESS) return result;
+      if (result.status === rpc.Api.GetTransactionStatus.FAILED) {
+        const message = formatTransactionFailure(result);
+        throw new TransactionFailedError(result.txHash, message, contractErrorCode(message));
+      }
+      await delay(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
+    }
+    throw new RpcTimeoutError('transaction confirmation', timeoutMs);
+  }
+
+  /**
+   * Builds, simulates and assembles a signable transaction.
+   *
+   * Fetches the source account for its sequence number, simulates first so
+   * the returned transaction carries an accurate resource footprint, and
+   * returns base64 XDR for the caller to sign (e.g. with Freighter) and
+   * submit. Simulation failures are re-thrown as typed governance errors
+   * where the contract code is recognisable.
+   */
+  private async buildGovernanceTransaction(
+    source: string,
+    method: string,
+    ...args: xdr.ScVal[]
+  ): Promise<string> {
+    const sourceAccount = await this.server.getAccount(source);
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(this.governance.call(method, ...args))
+      .setTimeout(30)
+      .build();
+
+    try {
+      const prepared = await this.server.prepareTransaction(tx);
+      return prepared.toXDR();
+    } catch (error) {
+      throw mapGovernanceSimulationError(method, error);
+    }
+  }
+
+  private async buildTokenTransaction(
+    source: string,
+    method: string,
+    ...args: xdr.ScVal[]
+  ): Promise<string> {
+    const token = this.requireToken();
+    const sourceAccount = await this.server.getAccount(source);
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    })
+      .addOperation(token.call(method, ...args))
+      .setTimeout(30)
+      .build();
+
+    try {
+      const prepared = await this.server.prepareTransaction(tx);
+      return prepared.toXDR();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Simulation of ${method} failed: ${message}`);
+    }
+  }
+
   // ─── Transaction Builders ────────────────────────────────────────────────
   // These return unsigned XDR strings — the caller signs with Freighter and submits.
 
-  async buildCreateProposal(proposer: string, title: string, description: string): Promise<string> {
-    // TODO: build transaction → governance.create_proposal(proposer, title, description)
-    throw new Error('Not implemented');
+  /**
+   * Builds signable XDR for `create_proposal(proposer, title, description)` (issue #113).
+   *
+   * Creates a new governance proposal. `proposer` must sign and must hold at
+   * least `proposalThreshold` tokens at the governance contract's snapshot
+   * ledger. `source` pays the fee and defaults to `proposer`.
+   *
+   * @throws {Error} proposal threshold or other contract errors.
+   */
+  async buildCreateProposal(proposer: string, title: string, description: string, source?: string): Promise<string> {
+    return this.buildGovernanceTransaction(
+      source ?? proposer,
+      'create_proposal',
+      new Address(proposer).toScVal(),
+      nativeToScVal(title, { type: 'string' }),
+      nativeToScVal(description, { type: 'string' }),
+    );
   }
 
-  async buildVote(voter: string, proposalId: bigint, support: VoteSupport): Promise<string> {
-    // TODO: build transaction → governance.vote(voter, proposalId, support)
-    throw new Error('Not implemented');
+  /**
+   * Builds signable XDR for `vote(voter, proposal_id, support)` (issue #114).
+   *
+   * Casts a vote on an active proposal. `support` is `0` (Against), `1` (For),
+   * or `2` (Abstain). `voter` must sign and must not have already voted on
+   * this proposal. `source` pays the fee and defaults to `voter`.
+   *
+   * @throws {ProposalNotFoundError} unknown proposal id.
+   * @throws {VotingNotActiveError} proposal voting window is closed.
+   */
+  async buildVote(voter: string, proposalId: bigint, support: VoteSupport, source?: string): Promise<string> {
+    return this.buildGovernanceTransaction(
+      source ?? voter,
+      'vote',
+      new Address(voter).toScVal(),
+      nativeToScVal(proposalId, { type: 'u64' }),
+      nativeToScVal(support, { type: 'u32' }),
+    );
   }
 
-  async buildFinalize(proposalId: bigint): Promise<string> {
-    // TODO: build transaction → governance.finalize(proposalId)
-    throw new Error('Not implemented');
+  /**
+   * Builds signable XDR for `finalize(proposal_id)` (issue #115).
+   *
+   * `finalize` takes no signer in the contract — anyone may call it once the
+   * voting window has closed — so the fee-paying `source` account is an
+   * explicit parameter. The returned XDR is unsigned; sign with Freighter.
+   *
+   * @throws {ProposalNotFoundError} unknown proposal id.
+   * @throws {VotingNotActiveError} voting window has not closed yet.
+   */
+  async buildFinalize(source: string, proposalId: bigint): Promise<string> {
+    return this.buildGovernanceTransaction(
+      source,
+      'finalize',
+      nativeToScVal(proposalId, { type: 'u64' }),
+    );
   }
 
-  async buildExecute(proposalId: bigint): Promise<string> {
-    // TODO: build transaction → governance.execute(proposalId)
-    throw new Error('Not implemented');
+  /**
+   * Builds signable XDR for `execute(proposal_id)` (issue #115).
+   *
+   * Like `finalize`, `execute` takes no signer in the contract, so `source`
+   * pays the fee. Only a `Queued` proposal whose timelock has expired can be
+   * executed.
+   *
+   * @throws {ProposalNotFoundError} unknown proposal id.
+   * @throws {ProposalNotPassedError} proposal is not `Queued` (still active,
+   * failed, already executed, or cancelled).
+   * @throws {TimelockNotExpiredError} timelock has not elapsed yet.
+   */
+  async buildExecute(source: string, proposalId: bigint): Promise<string> {
+    return this.buildGovernanceTransaction(
+      source,
+      'execute',
+      nativeToScVal(proposalId, { type: 'u64' }),
+    );
   }
+
+  /**
+   * Builds signable XDR for `cancel(caller, proposal_id)` (issue #116).
+   *
+   * Restricted by the contract to the proposer or the admin — anyone else
+   * fails with `Unauthorized`. `caller` must sign (via Freighter); `source`
+   * pays the fee and defaults to `caller` for the common single-wallet flow.
+   */
+  async buildCancel(caller: string, proposalId: bigint, source?: string): Promise<string> {
+    const feePayer = source ?? caller;
+    return this.buildGovernanceTransaction(
+      feePayer,
+      'cancel',
+      new Address(caller).toScVal(),
+      nativeToScVal(proposalId, { type: 'u64' }),
+    );
+  }
+
+  // ─── Token builders (issue #117) ─────────────────────────────────────────
+
+  /**
+   * Builds signable XDR for `transfer(from, to, amount)`.
+   * `from` must sign; `source` pays the fee and defaults to `from`.
+   */
+  async buildTransfer(from: string, to: string, amount: bigint, source?: string): Promise<string> {
+    return this.buildTokenTransaction(
+      source ?? from,
+      'transfer',
+      new Address(from).toScVal(),
+      new Address(to).toScVal(),
+      nativeToScVal(amount, { type: 'i128' }),
+    );
+  }
+
+  /**
+   * Builds signable XDR for `approve(owner, spender, amount,
+   * expiration_ledger)`.
+   *
+   * `expirationLedger` is a ledger sequence (u32), matching the contract's
+   * current signature: a live approval (`amount > 0`) must not expire in the
+   * past, while `amount == 0` revokes and accepts any expiration. `owner`
+   * must sign; `source` pays the fee and defaults to `owner`.
+   */
+  async buildApprove(
+    owner: string,
+    spender: string,
+    amount: bigint,
+    expirationLedger: number,
+    source?: string,
+  ): Promise<string> {
+    return this.buildTokenTransaction(
+      source ?? owner,
+      'approve',
+      new Address(owner).toScVal(),
+      new Address(spender).toScVal(),
+      nativeToScVal(amount, { type: 'i128' }),
+      nativeToScVal(expirationLedger, { type: 'u32' }),
+    );
+  }
+
+  /**
+   * Builds signable XDR for `transfer_from(spender, from, to, amount)`.
+   * `spender` must sign (the owner consented via `approve`); `source` pays
+   * the fee and defaults to `spender`.
+   */
+  async buildTransferFrom(
+    spender: string,
+    from: string,
+    to: string,
+    amount: bigint,
+    source?: string,
+  ): Promise<string> {
+    return this.buildTokenTransaction(
+      source ?? spender,
+      'transfer_from',
+      new Address(spender).toScVal(),
+      new Address(from).toScVal(),
+      new Address(to).toScVal(),
+      nativeToScVal(amount, { type: 'i128' }),
+    );
+  }
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function isTransientRpcError(error: unknown): boolean {
+  const candidate = error as { response?: { status?: number }; status?: number; code?: string; message?: string };
+  const status = candidate.response?.status ?? candidate.status;
+  return (typeof status === 'number' && (status === 408 || status === 429 || status >= 500))
+    || candidate.code === 'ECONNRESET'
+    || candidate.code === 'ETIMEDOUT'
+    || /(?:timeout|temporar|network|fetch failed|rate limit|try again)/i.test(candidate.message ?? '');
+}
+
+function isTimeoutError(error: unknown): boolean {
+  const candidate = error as { code?: string; message?: string };
+  return candidate.code === 'ECONNABORTED' || candidate.code === 'ETIMEDOUT' || /timeout/i.test(candidate.message ?? '');
+}
+
+function formatTransactionFailure(response: { hash?: string; txHash?: string; errorResult?: unknown; resultXdr?: unknown }): string {
+  const detail = response.errorResult ?? response.resultXdr;
+  return detail ? `Transaction ${response.hash ?? response.txHash ?? ''} failed: ${String(detail)}` : `Transaction ${response.hash ?? response.txHash ?? ''} failed`;
+}
+
+// ─── Decoding ──────────────────────────────────────────────────────────────
+// scValToNative output for the contract's #[contracttype] structs: field names
+// stay snake_case, i128/u64 become bigint, u32 becomes number, Address becomes
+// a strkey string, and a unit enum variant becomes a one-element [name] array.
+
+interface RawProposal {
+  id: bigint;
+  proposer: string;
+  title: string;
+  description: string;
+  for_votes: bigint;
+  against_votes: bigint;
+  abstain_votes: bigint;
+  snapshot_ledger: number;
+  start_ledger: number;
+  end_ledger: number;
+  queue_ledger: number;
+  quorum_required: bigint;
+  status: [string];
+}
+
+interface RawConfig {
+  token: string;
+  quorum_bps: number;
+  voting_period: number;
+  timelock_period: number;
+  proposal_threshold: bigint;
+  admin: string;
+}
+
+function decodeProposal(raw: RawProposal): Proposal {
+  return {
+    id: raw.id,
+    proposer: raw.proposer,
+    title: raw.title,
+    description: raw.description,
+    forVotes: raw.for_votes,
+    againstVotes: raw.against_votes,
+    abstainVotes: raw.abstain_votes,
+    snapshotLedger: raw.snapshot_ledger,
+    startLedger: raw.start_ledger,
+    endLedger: raw.end_ledger,
+    queueLedger: raw.queue_ledger,
+    quorumRequired: raw.quorum_required,
+    status: decodeStatus(raw.status),
+  };
+}
+
+const PROPOSAL_STATUSES: readonly ProposalStatus[] = [
+  'Pending', 'Active', 'Passed', 'Failed', 'Queued', 'Executed', 'Cancelled',
+];
+
+/** Unit enum variant `[name]` → ProposalStatus, rejecting names the SDK does not know. */
+function decodeStatus(raw: [string]): ProposalStatus {
+  const name = raw[0];
+  if (!(PROPOSAL_STATUSES as readonly string[]).includes(name)) {
+    throw new Error(`Unknown ProposalStatus variant: ${String(name)}`);
+  }
+  return name as ProposalStatus;
 }
 
 export const TESTNET: Partial<QuorumClientConfig> = {

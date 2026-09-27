@@ -17,6 +17,7 @@ function proposal(overrides: Partial<Proposal>): Proposal {
     status: "active",
     startTime: "2026-05-25T00:00:00Z",
     endTime: "2026-06-06T00:00:00Z",
+    snapshotLedger: 61_284_512,
     forVotes: 600000,
     againstVotes: 300000,
     abstainVotes: 100000,
@@ -66,6 +67,21 @@ describe("ProposalCard", () => {
       endTime: "2026-05-29T00:00:00Z",
     });
     const { container } = render(<ProposalCard proposal={passed} />);
+    expect(describeVisual(container.firstChild)).toMatchSnapshot();
+  });
+
+  it("matches the visual baseline for a proposal still short of quorum", () => {
+    // The state a prospective voter most needs to see: open, with votes on
+    // both sides, and not yet enough turnout to pass.
+    const short = proposal({
+      id: "QIP-009",
+      title: "Fund the Documentation Rewrite",
+      forVotes: 120000,
+      againstVotes: 40000,
+      abstainVotes: 20000,
+      quorumRequired: 500000,
+    });
+    const { container } = render(<ProposalCard proposal={short} />);
     expect(describeVisual(container.firstChild)).toMatchSnapshot();
   });
 });

@@ -1,12 +1,13 @@
 import type { ProposalStatus } from "@/lib/types";
+import { t } from "@/lib/i18n";
 
 const config: Record<ProposalStatus, { label: string; classes: string; dot?: string }> = {
-  active:    { label: "Active",    classes: "bg-blue-900/50 text-blue-300 border border-blue-700", dot: "bg-blue-400 animate-pulse" },
-  passed:    { label: "Passed",    classes: "bg-green-900/50 text-green-300 border border-green-700" },
-  failed:    { label: "Failed",    classes: "bg-red-900/50 text-red-300 border border-red-700" },
-  pending:   { label: "Pending",   classes: "bg-amber-900/50 text-amber-300 border border-amber-700" },
-  executed:  { label: "Executed",  classes: "bg-purple-900/50 text-purple-300 border border-purple-700" },
-  cancelled: { label: "Cancelled", classes: "bg-slate-800 text-slate-400 border border-slate-600" },
+  active:    { label: t("common.active"),    classes: "bg-blue-900/50 text-blue-300 border border-blue-700", dot: "bg-blue-400 animate-pulse" },
+  passed:    { label: t("common.passed"),    classes: "bg-green-900/50 text-green-300 border border-green-700" },
+  failed:    { label: t("common.failed"),    classes: "bg-red-900/50 text-red-300 border border-red-700" },
+  pending:   { label: t("common.pending"),   classes: "bg-amber-900/50 text-amber-300 border border-amber-700" },
+  executed:  { label: t("common.executed"),  classes: "bg-purple-900/50 text-purple-300 border border-purple-700" },
+  cancelled: { label: t("common.cancelled"), classes: "bg-slate-800 text-slate-400 border border-slate-600" },
 };
 
 export default function StatusBadge({ status }: { status: ProposalStatus }) {

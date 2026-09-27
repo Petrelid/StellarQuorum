@@ -14,3 +14,6 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+# Only for the lifecycle test in tests/: governance's own dependencies don't
+# include the token, so this dev-only edge does not form a build cycle.
+quorum-governance = { path = "../governance" }

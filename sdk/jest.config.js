@@ -1,9 +1,15 @@
-/**
- * The SDK suite runs fully offline: every test talks to a mock RPC server
- * bound to 127.0.0.1, so CI needs no external network access.
- */
+/** @type {import('jest').Config} */
 module.exports = {
-  preset: 'ts-jest',
+  preset: 'ts-jest/presets/default-esm',
   testEnvironment: 'node',
   roots: ['<rootDir>/test'],
+  extensionsToTreatAsEsm: ['.ts'],
+  transform: {
+    '^.+\\.tsx?$': ['ts-jest', { useESM: true, tsconfig: { module: 'ES2022' } }],
+  },
+  // Source files import each other with .js extensions so the emitted ESM
+  // resolves in Node; strip the extension so Jest loads the .ts source.
+  moduleNameMapper: {
+    '^(\\.{1,2}/.*)\\.js$': '$1',
+  },
 };
