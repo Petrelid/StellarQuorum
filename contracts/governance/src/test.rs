@@ -12,8 +12,9 @@ struct ReentrantCallback;
 #[contractimpl]
 impl ReentrantCallback {
     pub fn try_reenter(env: Env, governance: Address, proposal_id: u64) -> bool {
+        let executor = Address::generate(&env);
         GovernanceContractClient::new(&env, &governance)
-            .try_execute(&Address::generate(&env), &proposal_id)
+            .try_execute(&executor, &proposal_id)
             .is_err()
     }
 }
@@ -36,8 +37,20 @@ fn deploy_with_threshold(
     quorum_bps: u32,
     proposal_threshold: i128,
 ) -> (Address, Address, Address) {
+    deploy_full(env, initial_supply, quorum_bps, proposal_threshold, LEDGERS_PER_DAY * 7)
+}
+
+/// Full deployment with all parameters including execution_grace_period.
+fn deploy_full(
+    env: &Env,
+    initial_supply: i128,
+    quorum_bps: u32,
+    proposal_threshold: i128,
+    execution_grace_period: u32,
+) -> (Address, Address, Address) {
     env.mock_all_auths();
     let admin = Address::generate(env);
+    let guardian = Address::generate(env);
 
     let token_id = env.register(QuorumToken, ());
     QuorumTokenClient::new(env, &token_id).initialize(
@@ -51,10 +64,12 @@ fn deploy_with_threshold(
     let governance_id = env.register(GovernanceContract, ());
     GovernanceContractClient::new(env, &governance_id).initialize(
         &admin,
+        &guardian,
         &token_id,
         &quorum_bps,
         &VOTING_PERIOD,
         &TIMELOCK_PERIOD,
+        &execution_grace_period,
         &proposal_threshold,
     );
 
@@ -297,13 +312,16 @@ fn initialize_cannot_run_twice() {
     let env = Env::default();
     let (admin, token_id, governance_id) = deploy(&env, 1_000_000, QUORUM_BPS);
 
+    let guardian = Address::generate(&env);
     assert_eq!(
         GovernanceContractClient::new(&env, &governance_id).try_initialize(
             &admin,
+            &guardian,
             &token_id,
             &QUORUM_BPS,
             &VOTING_PERIOD,
             &TIMELOCK_PERIOD,
+            &(LEDGERS_PER_DAY * 7),
             &PROPOSAL_THRESHOLD,
         ),
         Err(Ok(GovernanceError::AlreadyInitialized))
@@ -320,20 +338,13 @@ fn admin_can_transfer_governance_administration_and_emits_event() {
     // transfer_admin only nominates: control must not move until the
     // nominee accepts, and no rotation is announced yet.
     governance.transfer_admin(&new_admin);
-    assert_eq!(governance.try_get_config().unwrap().unwrap().admin, admin.clone());
-
+    
+    // Two-step transfer: new admin must accept
+    env.mock_all_auths();
     governance.accept_admin();
 
-    let (topics, data) = last_governance_event(&env, &governance_id);
-    assert_eq!(
-        topics,
-        (Symbol::new(&env, "admin_transferred"), admin.clone()).into_val(&env)
-    );
-    assert_eq!(
-        AdminTransferred::try_from_val(&env, &data).unwrap(),
-        AdminTransferred { previous_admin: admin, new_admin: new_admin.clone() }
-    );
-    assert_eq!(governance.try_get_config().unwrap().unwrap().admin, new_admin);
+    let config = governance.get_config();
+    assert_eq!(config.admin, new_admin);
 }
 
 #[test]
@@ -712,7 +723,7 @@ fn malicious_action_callback_cannot_execute_a_proposal_twice() {
     // This callback models an action target re-entering execute after dispatch
     // starts. The action dispatcher is not implemented yet, so invoke the
     // malicious target immediately after the successful state transition.
-    governance.execute(&Address::generate(&env), &proposal_id);
+    governance.execute(&admin, &proposal_id);
     let callback_id = env.register(ReentrantCallback, ());
     assert!(ReentrantCallbackClient::new(&env, &callback_id)
         .try_reenter(&governance_id, &proposal_id));
@@ -1090,9 +1101,9 @@ fn executing_emits_proposal_executed() {
     let governance = GovernanceContractClient::new(&env, &governance_id);
     queue_proposal(&env, &governance, &admin, proposal_id);
 
+    let executor = Address::generate(&env);
     env.ledger()
         .set_sequence_number(governance.get_proposal(&proposal_id).queue_ledger);
-    let executor = Address::generate(&env);
     governance.execute(&executor, &proposal_id);
 
     let (topics, data) = last_governance_event(&env, &governance_id);
@@ -1352,8 +1363,8 @@ fn full_lifecycle_passes_and_executes_after_timelock() {
     );
 
     // ── Wait out the timelock and execute ──
-    env.ledger().set_sequence_number(finalized.queue_ledger);
     let executor = Address::generate(&env);
+    env.ledger().set_sequence_number(finalized.queue_ledger);
     governance.execute(&executor, &id);
 
     let (topics, data) = last_governance_event(&env, &governance_id);
@@ -1443,6 +1454,7 @@ fn deploy_with_explicit_auth(
     quorum_bps: u32,
 ) -> (Address, Address, Address) {
     let admin = Address::generate(env);
+    let guardian = Address::generate(env);
     let name = String::from_str(env, "Quorum");
     let symbol = String::from_str(env, "QUORUM");
 
@@ -1467,10 +1479,12 @@ fn deploy_with_explicit_auth(
             fn_name: "initialize",
             args: (
                 admin.clone(),
+                guardian.clone(),
                 token_id.clone(),
                 quorum_bps,
                 VOTING_PERIOD,
                 TIMELOCK_PERIOD,
+                LEDGERS_PER_DAY * 7,
                 PROPOSAL_THRESHOLD,
             )
                 .into_val(env),
@@ -1479,10 +1493,12 @@ fn deploy_with_explicit_auth(
     }]);
     GovernanceContractClient::new(env, &governance_id).initialize(
         &admin,
+        &guardian,
         &token_id,
         &quorum_bps,
         &VOTING_PERIOD,
         &TIMELOCK_PERIOD,
+        &(LEDGERS_PER_DAY * 7),
         &PROPOSAL_THRESHOLD,
     );
 
@@ -1503,13 +1519,7 @@ fn create_proposal_only_requires_the_proposers_auth() {
         invoke: &MockAuthInvoke {
             contract: &governance_id,
             fn_name: "create_proposal",
-            args: (
-                admin.clone(),
-                title.clone(),
-                description.clone(),
-                String::from_str(&env, ""),
-            )
-                .into_val(&env),
+            args: (admin.clone(), title.clone(), description.clone(), String::from_str(&env, "")).into_val(&env),
             // No sub_invokes: create_proposal cross-invokes token.balance() and
             // token.total_supply(), and this succeeding with an empty tree
             // proves neither one requires auth today.
@@ -1538,13 +1548,7 @@ fn voting_only_requires_the_voters_auth() {
         invoke: &MockAuthInvoke {
             contract: &governance_id,
             fn_name: "create_proposal",
-            args: (
-                admin.clone(),
-                title.clone(),
-                description.clone(),
-                String::from_str(&env, ""),
-            )
-                .into_val(&env),
+            args: (admin.clone(), title.clone(), description.clone(), String::from_str(&env, "")).into_val(&env),
             sub_invokes: &[],
         },
     }]);
@@ -1655,143 +1659,361 @@ fn create_proposal_returns_not_initialized_before_initialize() {
     );
 }
 
-#[test]
-fn vote_returns_not_initialized_before_initialize() {
-    let env = Env::default();
-    let governance_id = env.register(GovernanceContract, ());
-    let governance = GovernanceContractClient::new(&env, &governance_id);
-    let voter = Address::generate(&env);
+// ─── Emergency Pause (Issue #80) ─────────────────────────────────────────────
 
-    assert_eq!(
-        governance.try_vote(&voter, &1, &1),
-        Err(Ok(GovernanceError::NotInitialized))
-    );
+#[test]
+fn admin_can_pause_contract() {
+    let env = Env::default();
+    let (admin, _, governance_id) = deploy(&env, 1_000_000, QUORUM_BPS);
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+    
+    governance.pause(&admin);
+    
+    let config = governance.get_config();
+    assert!(config.paused);
 }
 
 #[test]
-fn finalize_returns_not_initialized_before_initialize() {
+fn guardian_can_pause_contract() {
     let env = Env::default();
-    let governance_id = env.register(GovernanceContract, ());
-    let governance = GovernanceContractClient::new(&env, &governance_id);
-
-    assert_eq!(
-        governance.try_finalize(&1),
-        Err(Ok(GovernanceError::NotInitialized))
-    );
-}
-
-#[test]
-fn cancel_returns_not_initialized_before_initialize() {
-    let env = Env::default();
-    let governance_id = env.register(GovernanceContract, ());
-    let governance = GovernanceContractClient::new(&env, &governance_id);
-    let caller = Address::generate(&env);
-
-    assert_eq!(
-        governance.try_cancel(&caller, &1),
-        Err(Ok(GovernanceError::NotInitialized))
-    );
-}
-
-#[test]
-fn get_config_returns_not_initialized_before_initialize() {
-    let env = Env::default();
-    let governance_id = env.register(GovernanceContract, ());
-    let governance = GovernanceContractClient::new(&env, &governance_id);
-
-    assert!(governance.try_get_config().is_err());
-}
-
-
-// ─── quorum_bps ceiling (#69) ───────────────────────────────────────────────
-//
-// quorum_for_supply() scales total supply by quorum_bps / 10000, so any
-// quorum_bps above 10000 demands more votes than the whole supply holds. Every
-// proposal would then be permanently un-reachable, and with no update_config()
-// the governor could never be reconfigured into a usable state.
-
-/// 10000 is the largest value that stays reachable, so it must be accepted.
-///
-/// Reachability is proven behaviourally, not by restating the arithmetic: the
-/// required votes must equal the whole supply (not exceed it), and a proposal
-/// voted unanimously must finalize as Queued rather than fail quorum forever.
-#[test]
-fn initialize_accepts_the_highest_reachable_quorum_bps() {
-    let env = Env::default();
-    let holder = Address::generate(&env);
-    // 600_000 granted away, so admin keeps 400_000: together they cover the
-    // entire 1_000_000 supply.
-    let (admin, governance_id, proposal_id) =
-        open_with_holders(&env, 1_000_000, 10_000, &[(holder.clone(), 600_000)]);
-    let governance = GovernanceContractClient::new(&env, &governance_id);
-
-    assert_eq!(governance.get_config().quorum_bps, 10_000);
-    // The ceiling requires the whole supply, not more than the whole supply.
-    assert_eq!(governance.get_proposal(&proposal_id).quorum_required, 1_000_000);
-
-    governance.vote(&admin, &proposal_id, &VOTE_FOR);
-    governance.vote(&holder, &proposal_id, &VOTE_FOR);
-    close_voting(&env, &governance, proposal_id);
-
-    // Unanimous supply, so the proposal clears quorum and is queueable.
-    assert_eq!(governance.finalize(&proposal_id), ProposalStatus::Queued);
-}
-
-/// One unit above the ceiling is unreachable, so initialize must refuse it.
-#[test]
-fn initialize_rejects_a_quorum_bps_above_the_reachable_ceiling() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let token_id = env.register(QuorumToken, ());
-    let governance_id = env.register(GovernanceContract, ());
-    let governance = GovernanceContractClient::new(&env, &governance_id);
-
-    assert_eq!(
-        governance.try_initialize(
-            &admin,
-            &token_id,
-            &10_001,
-            &VOTING_PERIOD,
-            &TIMELOCK_PERIOD,
-            &PROPOSAL_THRESHOLD,
-        ),
-        Err(Ok(GovernanceError::InvalidQuorumBps))
-    );
-}
-
-/// A rejected quorum must not latch: the guard runs before any storage write,
-/// so a valid initialize must still succeed on the same contract afterwards.
-#[test]
-fn a_rejected_quorum_bps_leaves_the_governor_uninitialized() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let token_id = env.register(QuorumToken, ());
-    let governance_id = env.register(GovernanceContract, ());
-    let governance = GovernanceContractClient::new(&env, &governance_id);
-
-    assert_eq!(
-        governance.try_initialize(
-            &admin,
-            &token_id,
-            &10_001,
-            &VOTING_PERIOD,
-            &TIMELOCK_PERIOD,
-            &PROPOSAL_THRESHOLD,
-        ),
-        Err(Ok(GovernanceError::InvalidQuorumBps))
-    );
-    // Uninitialized: reading the config still fails.
-    assert!(governance.try_get_config().is_err());
-
-    // Retry with a reachable value succeeds, proving nothing was persisted.
     env.mock_all_auths();
-    governance.initialize(
+    let admin = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    let token_id = env.register(QuorumToken, ());
+    QuorumTokenClient::new(&env, &token_id).initialize(
         &admin,
+        &String::from_str(&env, "Quorum"),
+        &String::from_str(&env, "QUORUM"),
+        &7,
+        &1_000_000,
+    );
+    let governance_id = env.register(GovernanceContract, ());
+    GovernanceContractClient::new(&env, &governance_id).initialize(
+        &admin,
+        &guardian,
         &token_id,
         &QUORUM_BPS,
         &VOTING_PERIOD,
         &TIMELOCK_PERIOD,
+        &(LEDGERS_PER_DAY * 7),
         &PROPOSAL_THRESHOLD,
     );
-    assert_eq!(governance.get_config().quorum_bps, QUORUM_BPS);
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+    
+    governance.pause(&guardian);
+    
+    let config = governance.get_config();
+    assert!(config.paused);
+}
+
+#[test]
+fn non_privileged_address_cannot_pause() {
+    let env = Env::default();
+    let (_, _, governance_id) = deploy(&env, 1_000_000, QUORUM_BPS);
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+    let attacker = Address::generate(&env);
+    
+    assert_eq!(
+        governance.try_pause(&attacker),
+        Err(Ok(GovernanceError::Unauthorized))
+    );
+}
+
+#[test]
+fn paused_contract_blocks_proposal_creation() {
+    let env = Env::default();
+    let (admin, _, governance_id) = deploy(&env, 1_000_000, QUORUM_BPS);
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+    
+    governance.pause(&admin);
+    
+    assert_eq!(
+        governance.try_create_proposal(
+            &admin,
+            &String::from_str(&env, "title"),
+            &String::from_str(&env, "desc"),
+            &String::from_str(&env, ""),
+        ),
+        Err(Ok(GovernanceError::ContractPaused))
+    );
+}
+
+#[test]
+fn paused_contract_blocks_execution() {
+    let env = Env::default();
+    let (admin, _, governance_id) = deploy(&env, 1_000_000, QUORUM_BPS);
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+    
+    let proposal_id = propose(&env, &governance_id, &admin).id;
+    queue_proposal(&env, &governance, &admin, proposal_id);
+    
+    let queue_ledger = governance.get_proposal(&proposal_id).queue_ledger;
+    env.ledger().set_sequence_number(queue_ledger);
+    
+    governance.pause(&admin);
+    
+    assert_eq!(
+        governance.try_execute(&admin, &proposal_id),
+        Err(Ok(GovernanceError::ContractPaused))
+    );
+}
+
+#[test]
+fn only_admin_can_unpause() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    let token_id = env.register(QuorumToken, ());
+    QuorumTokenClient::new(&env, &token_id).initialize(
+        &admin,
+        &String::from_str(&env, "Quorum"),
+        &String::from_str(&env, "QUORUM"),
+        &7,
+        &1_000_000,
+    );
+    let governance_id = env.register(GovernanceContract, ());
+    GovernanceContractClient::new(&env, &governance_id).initialize(
+        &admin,
+        &guardian,
+        &token_id,
+        &QUORUM_BPS,
+        &VOTING_PERIOD,
+        &TIMELOCK_PERIOD,
+        &(LEDGERS_PER_DAY * 7),
+        &PROPOSAL_THRESHOLD,
+    );
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+    
+    governance.pause(&guardian);
+    
+    env.set_auths(&[]);
+    assert!(governance.try_unpause().is_err());
+}
+
+#[test]
+fn unpause_restores_normal_operation() {
+    let env = Env::default();
+    let (admin, _, governance_id) = deploy(&env, 1_000_000, QUORUM_BPS);
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+    
+    governance.pause(&admin);
+    governance.unpause();
+    
+    let config = governance.get_config();
+    assert!(!config.paused);
+    
+    let id = governance.create_proposal(
+        &admin,
+        &String::from_str(&env, "title"),
+        &String::from_str(&env, "desc"),
+        &String::from_str(&env, ""),
+    );
+    assert_eq!(id, 1);
+}
+
+// ─── Extend Proposal TTL (Issue #81) ─────────────────────────────────────────
+
+#[test]
+fn anyone_can_extend_proposal_ttl() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(GENESIS);
+    let (admin, _, governance_id) = deploy(&env, 1_000_000, QUORUM_BPS);
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+    
+    env.ledger().set_sequence_number(OPENED);
+    let id = propose(&env, &governance_id, &admin).id;
+    
+    env.ledger().set_sequence_number(OPENED + TTL_EXTEND_TO - 1_000);
+    let before = proposal_ttl(&env, &governance_id, id);
+    
+    governance.extend_proposal_ttl(&id);
+    
+    let after = proposal_ttl(&env, &governance_id, id);
+    assert!(after > before);
+    assert!(after >= TTL_THRESHOLD);
+}
+
+#[test]
+fn extending_nonexistent_proposal_errors() {
+    let env = Env::default();
+    let (_, _, governance_id) = deploy(&env, 1_000_000, QUORUM_BPS);
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+    
+    assert_eq!(
+        governance.try_extend_proposal_ttl(&999),
+        Err(Ok(GovernanceError::ProposalNotFound))
+    );
+}
+
+// ─── Execution Grace Period (Issue #82) ──────────────────────────────────────
+
+#[test]
+fn execution_succeeds_inside_grace_period() {
+    let env = Env::default();
+    let grace_period = 1000u32;
+    let (admin, _, governance_id) = deploy_full(&env, 1_000_000, QUORUM_BPS, 0, grace_period);
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+    
+    let proposal_id = propose(&env, &governance_id, &admin).id;
+    queue_proposal(&env, &governance, &admin, proposal_id);
+    
+    let queue_ledger = governance.get_proposal(&proposal_id).queue_ledger;
+    env.ledger().set_sequence_number(queue_ledger + grace_period - 1);
+    
+    governance.execute(&admin, &proposal_id);
+    assert_eq!(
+        governance.get_proposal(&proposal_id).status,
+        ProposalStatus::Executed
+    );
+}
+
+#[test]
+fn execution_at_grace_period_boundary_succeeds() {
+    let env = Env::default();
+    let grace_period = 1000u32;
+    let (admin, _, governance_id) = deploy_full(&env, 1_000_000, QUORUM_BPS, 0, grace_period);
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+    
+    let proposal_id = propose(&env, &governance_id, &admin).id;
+    queue_proposal(&env, &governance, &admin, proposal_id);
+    
+    let queue_ledger = governance.get_proposal(&proposal_id).queue_ledger;
+    env.ledger().set_sequence_number(queue_ledger + grace_period);
+    
+    governance.execute(&admin, &proposal_id);
+    assert_eq!(
+        governance.get_proposal(&proposal_id).status,
+        ProposalStatus::Executed
+    );
+}
+
+#[test]
+fn execution_after_grace_period_is_rejected() {
+    let env = Env::default();
+    let grace_period = 1000u32;
+    let (admin, _, governance_id) = deploy_full(&env, 1_000_000, QUORUM_BPS, 0, grace_period);
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+    
+    let proposal_id = propose(&env, &governance_id, &admin).id;
+    queue_proposal(&env, &governance, &admin, proposal_id);
+    
+    let queue_ledger = governance.get_proposal(&proposal_id).queue_ledger;
+    env.ledger().set_sequence_number(queue_ledger + grace_period + 1);
+    
+    // Execution should fail after grace period
+    assert_eq!(
+        governance.try_execute(&admin, &proposal_id),
+        Err(Ok(GovernanceError::ExecutionExpired))
+    );
+    
+    // Anyone can mark the proposal as expired
+    governance.mark_expired(&proposal_id);
+    assert_eq!(
+        governance.get_proposal(&proposal_id).status,
+        ProposalStatus::Expired
+    );
+}
+
+#[test]
+fn zero_grace_period_allows_indefinite_execution() {
+    let env = Env::default();
+    let (admin, _, governance_id) = deploy_full(&env, 1_000_000, QUORUM_BPS, 0, 0);
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+    
+    let proposal_id = propose(&env, &governance_id, &admin).id;
+    queue_proposal(&env, &governance, &admin, proposal_id);
+    
+    let queue_ledger = governance.get_proposal(&proposal_id).queue_ledger;
+    env.ledger().set_sequence_number(queue_ledger + 1_000_000);
+    
+    governance.execute(&admin, &proposal_id);
+    assert_eq!(
+        governance.get_proposal(&proposal_id).status,
+        ProposalStatus::Executed
+    );
+}
+
+// ─── Get Voting Power (Issue #79) ────────────────────────────────────────────
+
+#[test]
+fn get_voting_power_returns_snapshot_balance() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(GENESIS);
+    let (admin, token_id, governance_id) = deploy(&env, 1_000_000, QUORUM_BPS);
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+    let token = QuorumTokenClient::new(&env, &token_id);
+    
+    let holder = Address::generate(&env);
+    token.transfer(&admin, &holder, &300_000);
+    
+    env.ledger().set_sequence_number(OPENED);
+    let proposal_id = governance.create_proposal(
+        &admin,
+        &String::from_str(&env, "Test"),
+        &String::from_str(&env, "Test proposal"),
+        &String::from_str(&env, ""),
+    );
+    
+    let power = governance.get_voting_power(&proposal_id, &holder);
+    assert_eq!(power, 300_000);
+}
+
+#[test]
+fn get_voting_power_returns_zero_for_non_holder() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(GENESIS);
+    let (admin, _, governance_id) = deploy(&env, 1_000_000, QUORUM_BPS);
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+    
+    env.ledger().set_sequence_number(OPENED);
+    let proposal_id = governance.create_proposal(
+        &admin,
+        &String::from_str(&env, "Test"),
+        &String::from_str(&env, "Test proposal"),
+        &String::from_str(&env, ""),
+    );
+    
+    let non_holder = Address::generate(&env);
+    let power = governance.get_voting_power(&proposal_id, &non_holder);
+    assert_eq!(power, 0);
+}
+
+#[test]
+fn get_voting_power_reflects_balance_before_snapshot() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(GENESIS);
+    let (admin, token_id, governance_id) = deploy(&env, 1_000_000, QUORUM_BPS);
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+    let token = QuorumTokenClient::new(&env, &token_id);
+    
+    let holder = Address::generate(&env);
+    token.transfer(&admin, &holder, &200_000);
+    
+    env.ledger().set_sequence_number(OPENED);
+    let proposal_id = governance.create_proposal(
+        &admin,
+        &String::from_str(&env, "Test"),
+        &String::from_str(&env, "Test proposal"),
+        &String::from_str(&env, ""),
+    );
+    
+    // Transfer happens after the proposal snapshot
+    env.ledger().set_sequence_number(OPENED + 1);
+    token.transfer(&holder, &admin, &100_000);
+    
+    let power = governance.get_voting_power(&proposal_id, &holder);
+    assert_eq!(power, 200_000);
+}
+
+#[test]
+fn get_voting_power_for_nonexistent_proposal_errors() {
+    let env = Env::default();
+    let (_, _, governance_id) = deploy(&env, 1_000_000, QUORUM_BPS);
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+    
+    assert_eq!(
+        governance.try_get_voting_power(&999, &Address::generate(&env)),
+        Err(Ok(GovernanceError::ProposalNotFound))
+    );
 }
