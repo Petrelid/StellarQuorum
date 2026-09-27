@@ -294,7 +294,7 @@ fn initialize_stores_the_supplied_config() {
     let (admin, token_id, governance_id) =
         deploy_with_threshold(&env, 1_000_000, QUORUM_BPS, THRESHOLD);
 
-    let config = GovernanceContractClient::new(&env, &governance_id).get_config();
+    let config = GovernanceContractClient::new(&env, &governance_id).try_get_config().unwrap().unwrap();
     assert_eq!(config.admin, admin);
     assert_eq!(config.token, token_id);
     assert_eq!(config.quorum_bps, QUORUM_BPS);
@@ -335,6 +335,8 @@ fn admin_can_transfer_governance_administration_and_emits_event() {
     let governance = GovernanceContractClient::new(&env, &governance_id);
     let new_admin = Address::generate(&env);
 
+    // transfer_admin only nominates: control must not move until the
+    // nominee accepts, and no rotation is announced yet.
     governance.transfer_admin(&new_admin);
     
     // Two-step transfer: new admin must accept
@@ -354,7 +356,7 @@ fn governance_admin_transfer_requires_current_admin_authorization() {
     env.set_auths(&[]);
 
     assert!(governance.try_transfer_admin(&attacker).is_err());
-    assert_eq!(governance.get_config().admin, admin);
+    assert_eq!(governance.try_get_config().unwrap().unwrap().admin, admin);
     assert!(env.events().all().is_empty());
 }
 
@@ -905,7 +907,7 @@ fn a_proposal_outlives_a_long_voting_window() {
 
     assert_eq!(governance.get_proposal(&id).id, id);
     // Instance storage carries Config; losing it would brick the contract.
-    assert_eq!(governance.get_config().quorum_bps, QUORUM_BPS);
+    assert_eq!(governance.try_get_config().unwrap().unwrap().quorum_bps, QUORUM_BPS);
 }
 
 #[test]
@@ -1620,7 +1622,7 @@ fn two_step_admin_transfer_works() {
     env.mock_all_auths();
     governance.accept_admin();
     
-    let config = governance.get_config();
+    let config = governance.try_get_config().unwrap().unwrap();
     assert_eq!(config.admin, new_admin);
 }
 
@@ -1637,7 +1639,25 @@ fn cancel_admin_transfer_works() {
     assert!(governance.try_accept_admin().is_err());
 }
 
+// ─── NotInitialized error handling ─────────────────────────────────────────────
 
+#[test]
+fn create_proposal_returns_not_initialized_before_initialize() {
+    let env = Env::default();
+    let governance_id = env.register(GovernanceContract, ());
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+    let proposer = Address::generate(&env);
+
+    assert_eq!(
+        governance.try_create_proposal(
+            &proposer,
+            &String::from_str(&env, "Test"),
+            &String::from_str(&env, "Description"),
+            &String::from_str(&env, ""),
+        ),
+        Err(Ok(GovernanceError::NotInitialized))
+    );
+}
 
 // ─── Emergency Pause (Issue #80) ─────────────────────────────────────────────
 

@@ -1,4 +1,5 @@
 import { TOKEN_DECIMALS, USE_FIXTURE, createQuorumClient } from "./config";
+import { formatNumber, getLocale } from "./i18n";
 
 /**
  * Snapshot balances served in fixture mode, keyed by the last four characters of
@@ -82,26 +83,22 @@ export function unitsOf(amount: number | bigint, decimals = TOKEN_DECIMALS): big
  * Renders raw token units as an amount, e.g. `BigInt(25000000000)` at 7
  * decimals as "2,500".
  *
- * Grouping is done on the digit string rather than through `Intl` so that
- * supply-sized amounts keep full precision: a token amount in raw units can
- * exceed `Number.MAX_SAFE_INTEGER`.
+ * `Intl.NumberFormat` accepts bigint values, preserving exact supply-sized amounts
+ * while applying the active locale's grouping and decimal separators.
  */
 export function formatTokenAmount(units: bigint, decimals = TOKEN_DECIMALS): string {
   const scale = BigInt(10) ** BigInt(decimals);
-  const whole = groupDigits((units / scale).toString());
+  const whole = formatNumber(units / scale);
   const fraction = units % scale;
   if (fraction <= ZERO) return whole;
   // Balances are exact on chain but unreadable at seven places, so keep at most
   // four decimals and drop trailing zeros.
   const trimmed = fraction.toString().padStart(decimals, "0").replace(/0+$/, "").slice(0, 4);
-  return `${whole}.${trimmed}`;
+  const separator = new Intl.NumberFormat(getLocale()).formatToParts(1.1).find(part => part.type === "decimal")?.value ?? ".";
+  return `${whole}${separator}${trimmed}`;
 }
 
 /** Ledger sequence as a reader would write it, e.g. 61_284_512 as "61,284,512". */
 export function formatLedger(ledger: number): string {
-  return ledger.toLocaleString("en-US");
-}
-
-function groupDigits(digits: string): string {
-  return digits.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return formatNumber(ledger);
 }

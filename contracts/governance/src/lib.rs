@@ -40,6 +40,12 @@ pub enum GovernanceError {
 /// Basis-point denominator: `quorum_bps` of 500 means 5% of total supply.
 const BPS_DENOMINATOR: i128 = 10_000;
 
+/// Largest `quorum_bps` that can still be reached. 10000 means "the entire
+/// supply must vote", which is a legitimate (if strict) setting; anything
+/// above it demands more votes than exist, so no proposal could ever reach
+/// quorum and there is no way to recover the parameter.
+const MAX_QUORUM_BPS: u32 = 10_000;
+
 /// Ledgers in roughly one day, at Stellar's ~5 second close time.
 const LEDGERS_PER_DAY: u32 = 17_280;
 
@@ -159,6 +165,7 @@ pub struct Proposal {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub token: Address,
     pub quorum_bps: u32,
@@ -190,6 +197,12 @@ impl GovernanceContract {
         if env.storage().instance().has(&DataKey::Config) {
             return Err(GovernanceError::AlreadyInitialized);
         }
+        // Reject an unreachable quorum before any state is written. Above
+        // MAX_QUORUM_BPS the required votes exceed the total supply, so every
+        // proposal would fail forever and the parameter could never be fixed.
+        if quorum_bps > MAX_QUORUM_BPS {
+            return Err(GovernanceError::InvalidQuorumBps);
+        }
         admin.require_auth();
         let config = Config { token, quorum_bps, voting_period, timelock_period, proposal_threshold, admin, guardian, execution_grace_period, paused: false };
         env.storage().instance().set(&DataKey::Config, &config);
@@ -202,6 +215,7 @@ impl GovernanceContract {
     }
 
     pub fn create_proposal(env: Env, proposer: Address, title: String, description: String, metadata_uri: String) -> Result<u64, GovernanceError> {
+        let config: Config = Self::require_config(&env)?;
         proposer.require_auth();
         let config: Config = env.storage().instance().get(&DataKey::Config).unwrap();
         
@@ -257,6 +271,7 @@ impl GovernanceContract {
     }
 
     pub fn vote(env: Env, voter: Address, proposal_id: u64, support: u32) -> Result<(), GovernanceError> {
+        let config: Config = Self::require_config(&env)?;
         voter.require_auth();
         if support > 2 { return Err(GovernanceError::InvalidVoteChoice); }
         if env.storage().persistent().has(&DataKey::HasVoted(proposal_id, voter.clone())) {
@@ -269,7 +284,6 @@ impl GovernanceContract {
 
         // Power is read at the proposal's snapshot ledger, not live, so tokens
         // bought or borrowed after the proposal opened carry no weight.
-        let config: Config = env.storage().instance().get(&DataKey::Config).unwrap();
         let voting_power = TokenClient::new(&env, &config.token)
             .get_past_balance(&voter, &proposal.snapshot_ledger);
         if voting_power <= 0 { return Err(GovernanceError::NoVotingPower); }
@@ -294,10 +308,10 @@ impl GovernanceContract {
     }
 
     pub fn finalize(env: Env, proposal_id: u64) -> Result<ProposalStatus, GovernanceError> {
+        let config: Config = Self::require_config(&env)?;
         let mut proposal: Proposal = env.storage().persistent()
             .get(&DataKey::Proposal(proposal_id)).ok_or(GovernanceError::ProposalNotFound)?;
         if env.ledger().sequence() <= proposal.end_ledger { return Err(GovernanceError::VotingNotActive); }
-        let config: Config = env.storage().instance().get(&DataKey::Config).unwrap();
         let total = proposal.for_votes + proposal.against_votes + proposal.abstain_votes;
         let quorum_ok = total >= proposal.quorum_required;
         let majority_for = proposal.for_votes > proposal.against_votes;
@@ -416,14 +430,14 @@ impl GovernanceContract {
     }
 
     pub fn get_config(env: Env) -> Config {
-        env.storage().instance().get(&DataKey::Config).unwrap()
+        Self::require_config(&env).unwrap()
     }
 
     pub fn cancel(env: Env, caller: Address, proposal_id: u64) -> Result<(), GovernanceError> {
+        let config: Config = Self::require_config(&env)?;
         caller.require_auth();
         let mut proposal: Proposal = env.storage().persistent()
             .get(&DataKey::Proposal(proposal_id)).ok_or(GovernanceError::ProposalNotFound)?;
-        let config: Config = env.storage().instance().get(&DataKey::Config).unwrap();
         if caller != proposal.proposer && caller != config.admin {
             return Err(GovernanceError::Unauthorized);
         }
@@ -530,6 +544,14 @@ impl GovernanceContract {
 /// Internal helpers — outside `#[contractimpl]` so they are not exported as
 /// contract functions.
 impl GovernanceContract {
+    /// Returns the config if initialized, otherwise returns NotInitialized error.
+    fn require_config(env: &Env) -> Result<Config, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(GovernanceError::NotInitialized)
+    }
+
     /// Quorum threshold for a given circulating supply: `supply * bps / 10000`.
     ///
     /// Integer division truncates, so the threshold is never rounded up beyond

@@ -3,6 +3,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Scale } from "lucide-react";
 import { useWallet } from "./WalletProvider";
+import { t } from "@/lib/i18n";
 
 /** Addresses are long and uniform; the tail is what makes one recognisable. */
 function shorten(address: string): string {
@@ -21,25 +22,13 @@ export default function Navbar() {
           Quorum
         </Link>
         <div className="flex items-center gap-6 text-sm text-slate-400">
-          <Link
-            href="/proposals"
-            className={`hover:text-slate-200 focus-visible:text-slate-200 hover:underline focus-visible:underline underline-offset-4 transition-colors ${pathname?.startsWith('/proposals') ? 'text-slate-200 underline' : ''}`}
-            aria-current={pathname?.startsWith('/proposals') ? 'page' : undefined}
-          >
-            Proposals
-          </Link>
-          <Link
-            href="/create"
-            className={`hover:text-slate-200 focus-visible:text-slate-200 hover:underline focus-visible:underline underline-offset-4 transition-colors ${pathname === '/create' ? 'text-slate-200 underline' : ''}`}
-            aria-current={pathname === '/create' ? 'page' : undefined}
-          >
-            Create
-          </Link>
+          <Link href="/proposals" className="hover:text-slate-200 hover:underline underline-offset-4 transition-colors">{t("nav.proposals")}</Link>
+          <Link href="/create" className="hover:text-slate-200 hover:underline underline-offset-4 transition-colors">{t("nav.create")}</Link>
           {address ? (
             <button
               onClick={disconnect}
-              className="px-4 py-1.5 border border-[#1e2d40] text-slate-300 hover:bg-[#162032] focus-visible:bg-[#162032] rounded-md transition-colors font-mono"
-              aria-label={`Disconnect wallet ${address}`}
+              className="px-4 py-1.5 border border-[#1e2d40] text-slate-300 hover:bg-[#162032] rounded-md transition-colors font-mono"
+              aria-label={t("nav.disconnect", { address })}
             >
               {shorten(address)}
             </button>
@@ -49,7 +38,7 @@ export default function Navbar() {
               disabled={pending}
               className="px-4 py-1.5 border border-blue-700 text-blue-400 hover:bg-blue-900/30 focus-visible:bg-blue-900/30 rounded-md transition-colors disabled:opacity-50"
             >
-              {pending ? "Connecting…" : "Connect Wallet"}
+              {pending ? t("nav.connecting") : t("nav.connect")}
             </button>
           )}
         </div>

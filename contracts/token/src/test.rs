@@ -38,6 +38,59 @@ fn initialize_sets_metadata_supply_and_admin_balance() {
 }
 
 #[test]
+fn initialize_accepts_zero_supply_for_later_minting() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let token_id = env.register(QuorumToken, ());
+    let token = QuorumTokenClient::new(&env, &token_id);
+
+    token.initialize(
+        &admin,
+        &String::from_str(&env, "Quorum"),
+        &String::from_str(&env, "QUORUM"),
+        &18,
+        &0,
+    );
+
+    assert_eq!(token.total_supply(), 0);
+    assert_eq!(token.balance(&admin), 0);
+}
+
+#[test]
+fn initialize_rejects_negative_supply_and_decimals_above_eighteen() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let negative_id = env.register(QuorumToken, ());
+    let negative = QuorumTokenClient::new(&env, &negative_id);
+
+    assert_eq!(
+        negative.try_initialize(
+            &admin,
+            &String::from_str(&env, "Quorum"),
+            &String::from_str(&env, "QUORUM"),
+            &7,
+            &-1,
+        ),
+        Err(Ok(TokenError::InvalidSupply))
+    );
+
+    let decimals_id = env.register(QuorumToken, ());
+    let decimals = QuorumTokenClient::new(&env, &decimals_id);
+    assert_eq!(
+        decimals.try_initialize(
+            &admin,
+            &String::from_str(&env, "Quorum"),
+            &String::from_str(&env, "QUORUM"),
+            &19,
+            &0,
+        ),
+        Err(Ok(TokenError::InvalidDecimals))
+    );
+}
+
+#[test]
 fn initialize_cannot_run_twice() {
     let env = Env::default();
     let (admin, token) = deploy(&env);
@@ -63,6 +116,16 @@ fn balance_of_an_unknown_address_is_zero() {
     let (_, token) = deploy(&env);
 
     assert_eq!(token.balance(&Address::generate(&env)), 0);
+}
+
+#[test]
+fn spendable_balance_matches_balance() {
+    let env = Env::default();
+    let (admin, token) = deploy(&env);
+    let holder = Address::generate(&env);
+    token.transfer(&admin, &holder, &12_345);
+
+    assert_eq!(token.spendable_balance(&holder), token.balance(&holder));
 }
 
 // ─── Transfer ────────────────────────────────────────────────────────────────
@@ -319,6 +382,64 @@ fn burn_lowers_the_holder_balance_and_total_supply() {
 
     assert_eq!(token.balance(&admin), INITIAL_SUPPLY - 400_000);
     assert_eq!(token.total_supply(), INITIAL_SUPPLY - 400_000);
+}
+
+#[test]
+fn burn_from_spends_allowance_and_emits_owner_burn_event() {
+    let env = Env::default();
+    let (admin, token) = deploy(&env);
+    let spender = Address::generate(&env);
+    token.approve(&admin, &spender, &50_000, &FAR_FUTURE);
+
+    token.burn_from(&spender, &admin, &20_000);
+
+    let (topics, data) = last_event(&env);
+
+    assert_eq!(token.balance(&admin), INITIAL_SUPPLY - 20_000);
+    assert_eq!(token.total_supply(), INITIAL_SUPPLY - 20_000);
+    assert_eq!(token.allowance(&admin, &spender), 30_000);
+
+    assert_eq!(
+        topics,
+        (Symbol::new(&env, "burn"), admin.clone()).into_val(&env)
+    );
+    assert_eq!(
+        Burn::try_from_val(&env, &data).unwrap(),
+        Burn { from: admin, amount: 20_000, total_supply: INITIAL_SUPPLY - 20_000 }
+    );
+}
+
+#[test]
+fn burn_from_rejects_insufficient_allowance_without_changes() {
+    let env = Env::default();
+    let (admin, token) = deploy(&env);
+    let spender = Address::generate(&env);
+    token.approve(&admin, &spender, &10_000, &FAR_FUTURE);
+
+    assert_eq!(
+        token.try_burn_from(&spender, &admin, &10_001),
+        Err(Ok(TokenError::InsufficientAllowance))
+    );
+    assert_eq!(token.balance(&admin), INITIAL_SUPPLY);
+    assert_eq!(token.total_supply(), INITIAL_SUPPLY);
+    assert_eq!(token.allowance(&admin, &spender), 10_000);
+}
+
+#[test]
+fn burn_from_rejects_an_expired_allowance() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(100);
+    let (admin, token) = deploy(&env);
+    let spender = Address::generate(&env);
+    token.approve(&admin, &spender, &50_000, &200);
+
+    env.ledger().set_sequence_number(201);
+    assert_eq!(
+        token.try_burn_from(&spender, &admin, &1_000),
+        Err(Ok(TokenError::InsufficientAllowance))
+    );
+    assert_eq!(token.balance(&admin), INITIAL_SUPPLY);
+    assert_eq!(token.total_supply(), INITIAL_SUPPLY);
 }
 
 #[test]
@@ -790,7 +911,7 @@ fn a_negative_approval_is_rejected() {
 #[test]
 fn transfer_admin_hands_minting_rights_to_the_new_admin() {
     let env = Env::default();
-    let (admin, token) = deploy(&env);
+    let (_admin, token) = deploy(&env);
     let new_admin = Address::generate(&env);
 
     token.transfer_admin(&new_admin);
@@ -920,6 +1041,102 @@ fn binary_search_resolves_the_correct_entry_across_many_checkpoints() {
     assert_eq!(token.get_past_balance(&holder, &10_000), 20_000);
 }
 
+// ─── Supply checkpoints ──────────────────────────────────────────────────────
+
+#[test]
+fn initial_supply_is_checkpointed() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (_admin, token) = deploy(&env);
+
+    assert_eq!(token.get_past_total_supply(&9), 0);
+    assert_eq!(token.get_past_total_supply(&10), INITIAL_SUPPLY);
+    assert_eq!(token.get_past_total_supply(&1_000), INITIAL_SUPPLY);
+}
+
+#[test]
+fn mint_and_burn_checkpoint_total_supply() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (admin, token) = deploy(&env);
+
+    env.ledger().set_sequence_number(30);
+    token.mint(&admin, &500_000);
+    env.ledger().set_sequence_number(40);
+    token.burn(&admin, &200_000);
+
+    assert_eq!(token.get_past_total_supply(&29), INITIAL_SUPPLY);
+    assert_eq!(token.get_past_total_supply(&30), 1_500_000);
+    assert_eq!(token.get_past_total_supply(&39), 1_500_000);
+    assert_eq!(token.get_past_total_supply(&40), 1_300_000);
+    assert_eq!(token.get_past_total_supply(&40), token.total_supply());
+}
+
+#[test]
+fn transfers_do_not_move_past_total_supply() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (admin, token) = deploy(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_sequence_number(20);
+    token.transfer(&admin, &recipient, &400_000);
+
+    assert_eq!(token.get_past_total_supply(&20), INITIAL_SUPPLY);
+}
+
+#[test]
+fn supply_changes_in_one_ledger_collapse_to_the_closing_supply() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (admin, token) = deploy(&env);
+
+    env.ledger().set_sequence_number(20);
+    token.mint(&admin, &100_000);
+    token.burn(&admin, &30_000);
+    token.mint(&admin, &5_000);
+
+    assert_eq!(token.get_past_total_supply(&20), 1_075_000);
+    assert_eq!(token.get_past_total_supply(&19), INITIAL_SUPPLY);
+}
+
+#[test]
+fn a_refused_mint_writes_no_supply_checkpoint() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(10);
+    let (admin, token) = deploy(&env);
+
+    env.ledger().set_sequence_number(20);
+    assert_eq!(
+        token.try_mint(&admin, &i128::MAX),
+        Err(Ok(TokenError::Overflow))
+    );
+    assert_eq!(token.get_past_total_supply(&20), INITIAL_SUPPLY);
+}
+
+#[test]
+fn supply_history_is_kept_past_the_balance_retention_window() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(1);
+    let (admin, token) = deploy(&env);
+
+    env.ledger().set_sequence_number(100);
+    token.mint(&admin, &1);
+    env.ledger().set_sequence_number(200);
+    token.mint(&admin, &1);
+
+    // Far enough on that balance checkpoints from ledgers 1–200 would prune,
+    // but inside the TTL that the mints above extended instance storage to.
+    let later = 200 + CHECKPOINT_RETENTION + 10;
+    env.ledger().set_sequence_number(later);
+    token.mint(&admin, &1);
+
+    assert_eq!(token.get_past_total_supply(&1), INITIAL_SUPPLY);
+    assert_eq!(token.get_past_total_supply(&100), INITIAL_SUPPLY + 1);
+    assert_eq!(token.get_past_total_supply(&200), INITIAL_SUPPLY + 2);
+    assert_eq!(token.get_past_total_supply(&later), INITIAL_SUPPLY + 3);
+}
+
 // ─── Property test: binary search vs. naive linear scan (#161) ───────────────
 
 /// Minimal, dependency-free xorshift32 PRNG. Deterministic (fixed seed) so
@@ -946,7 +1163,7 @@ impl Xorshift32 {
 /// Naive O(n) scan mirroring the contract's contract: the balance in effect
 /// at `ledger` is the most recent checkpoint at or before it, or 0 if none
 /// qualifies (including an empty history).
-fn naive_past_balance(history: &std::vec::Vec<(u32, i128)>, ledger: u32) -> i128 {
+fn naive_past_balance(history: &[(u32, i128)], ledger: u32) -> i128 {
     history
         .iter()
         .rev()
@@ -1190,7 +1407,7 @@ fn history_just_past_the_window_keeps_one_anchor_and_the_new_entry() {
 #[test]
 fn cancel_admin_transfer_stops_handover() {
     let env = Env::default();
-    let (admin, token) = deploy(&env);
+    let (_admin, token) = deploy(&env);
     let new_admin = Address::generate(&env);
 
     token.transfer_admin(&new_admin);

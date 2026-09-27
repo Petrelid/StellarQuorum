@@ -1,6 +1,7 @@
 'use client';
 
 import { createContext, useCallback, useContext, useMemo, useState } from "react";
+import { t } from "@/lib/i18n";
 
 /** The slice of the Freighter extension API this app uses. */
 interface Freighter {
@@ -46,7 +47,7 @@ export default function WalletProvider({ children }: { children: React.ReactNode
     try {
       const freighter = window.freighter;
       if (!freighter) {
-        setError("No Stellar wallet extension found. Install Freighter to connect.");
+        setError(t("nav.noWallet"));
         return;
       }
       const { publicKey } = await freighter.connect();
@@ -55,7 +56,7 @@ export default function WalletProvider({ children }: { children: React.ReactNode
       // Covers both a user rejection and a locked extension. The extension's own
       // wording is not a stable API, so its message is shown as-is and anything
       // else falls back to a refusal the user can act on.
-      setError(cause instanceof Error ? cause.message : "Wallet connection was refused.");
+      setError(cause instanceof Error ? cause.message : t("nav.refused"));
     } finally {
       setPending(false);
     }

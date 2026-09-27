@@ -3,13 +3,14 @@
 import { useState } from "react";
 import ProposalCard from "@/components/ProposalCard";
 import type { Proposal, ProposalStatus } from "@/lib/types";
+import { formatNumber, t } from "@/lib/i18n";
 
 const FILTERS: { label: string; value: ProposalStatus | "all" }[] = [
-  { label: "All", value: "all" },
-  { label: "Active", value: "active" },
-  { label: "Passed", value: "passed" },
-  { label: "Failed", value: "failed" },
-  { label: "Pending", value: "pending" },
+  { label: t("proposals.all"), value: "all" },
+  { label: t("common.active"), value: "active" },
+  { label: t("common.passed"), value: "passed" },
+  { label: t("common.failed"), value: "failed" },
+  { label: t("common.pending"), value: "pending" },
 ];
 
 export default function ProposalList({ proposals }: { proposals: Proposal[] }) {
@@ -21,8 +22,8 @@ export default function ProposalList({ proposals }: { proposals: Proposal[] }) {
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 py-8 sm:py-12">
       <div className="mb-8">
-        <h1 className="text-3xl font-bold text-white mb-2">All Proposals</h1>
-        <p className="text-slate-400">{proposals.length} proposals &middot; <span className="text-blue-400">{activeCount} active</span></p>
+        <h1 className="text-3xl font-bold text-white mb-2">{t("proposals.title")}</h1>
+        <p className="text-slate-400">{t("proposals.summary", { total: formatNumber(proposals.length), active: formatNumber(activeCount) })}</p>
       </div>
 
       {/* Filter tabs */}
@@ -48,7 +49,7 @@ export default function ProposalList({ proposals }: { proposals: Proposal[] }) {
       </div>
 
       {filtered.length === 0 ? (
-        <div className="text-center py-16 text-slate-500">No proposals match the selected filter. Try &quot;All&quot; to see everything.</div>
+        <div className="text-center py-16 text-slate-500">{t("proposals.empty")}</div>
       ) : (
         <div className="grid md:grid-cols-2 gap-4">
           {filtered.map(p => (

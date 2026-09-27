@@ -1,17 +1,12 @@
 import Link from "next/link";
 import type { Proposal } from "@/lib/types";
+import QuorumProgress from "./QuorumProgress";
 import StatusBadge from "./StatusBadge";
 import VoteBar from "./VoteBar";
-
-function daysRelative(iso: string, future: boolean): string {
-  const diff = Math.abs(new Date(iso).getTime() - Date.now());
-  const days = Math.round(diff / 86400000);
-  if (days === 0) return future ? "Ends today" : "Ended today";
-  return future ? `Ends in ${days}d` : `Ended ${days}d ago`;
-}
+import { describeDeadline, formatAbsolute } from "@/lib/time";
 
 export default function ProposalCard({ proposal }: { proposal: Proposal }) {
-  const isActive = proposal.status === "active" || proposal.status === "pending";
+  const deadline = describeDeadline(proposal);
   const total = proposal.forVotes + proposal.againstVotes + proposal.abstainVotes;
 
   return (
@@ -32,7 +27,10 @@ export default function ProposalCard({ proposal }: { proposal: Proposal }) {
         </h3>
 
         <p className="text-xs text-slate-500 mb-4">
-          Proposed by <span title={proposal.proposer}>{proposal.proposer}</span> &middot; {daysRelative(proposal.endTime, isActive)}
+          Proposed by <span title={proposal.proposer}>{proposal.proposer}</span> &middot;{" "}
+          <time dateTime={deadline.iso} title={formatAbsolute(deadline.iso)} suppressHydrationWarning>
+            {deadline.label}
+          </time>
         </p>
 
         <VoteBar
@@ -48,6 +46,16 @@ export default function ProposalCard({ proposal }: { proposal: Proposal }) {
             <span className="text-red-400">{(proposal.againstVotes / 1000).toFixed(0)}K Against</span>
           </div>
         )}
+
+        {/* Whether this proposal can still fail for want of turnout, before a
+            reader has opened it. Also on the detail page, at full size. */}
+        <QuorumProgress
+          forVotes={proposal.forVotes}
+          againstVotes={proposal.againstVotes}
+          abstainVotes={proposal.abstainVotes}
+          quorumRequired={proposal.quorumRequired}
+          compact
+        />
       </div>
     </Link>
   );

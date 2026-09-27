@@ -1,3 +1,5 @@
+import { formatNumber, t } from "@/lib/i18n";
+
 interface VoteBarProps {
   forVotes: number;
   againstVotes: number;
@@ -24,9 +26,9 @@ export default function VoteBar({ forVotes, againstVotes, abstainVotes, compact 
       </div>
       {!compact && (
         <div className="flex gap-4 text-xs text-slate-400">
-          <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-emerald-500" />For {forPct.toFixed(1)}%</span>
-          <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-red-500" />Against {againstPct.toFixed(1)}%</span>
-          <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-slate-500" />Abstain {abstainPct.toFixed(1)}%</span>
+          <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-emerald-500" />{t("common.for")} {formatNumber(forPct, { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%</span>
+          <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-red-500" />{t("common.against")} {formatNumber(againstPct, { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%</span>
+          <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-slate-500" />{t("common.abstain")} {formatNumber(abstainPct, { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%</span>
         </div>
       )}
     </div>

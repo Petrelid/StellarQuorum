@@ -11,9 +11,18 @@ SEP-41 compatible governance token for the Quorum protocol.
 - `transfer_from` — spender moves tokens on behalf of an owner, against an allowance
 - `allowance` — remaining allowance, or 0 once the approval has lapsed
 - `get_past_balance` — balance as of a past ledger, backing snapshot voting power
+- `get_past_total_supply` — total supply as of a past ledger, for auditing a
+  proposal's `quorum_required`
 - `mint` returns `Overflow` if the new total supply or balance would exceed
   `i128::MAX`, and `burn` returns `Overflow` rather than take total supply below
   zero. Neither traps, and a refused call changes nothing.
+
+`burn_from` lets an approved spender burn against the owner's allowance and
+emits a burn event naming that owner. `spendable_balance` is equal to `balance`
+because this token has no locked balances.
+
+Initialization accepts decimal precision from 0 through 18 and rejects a
+negative initial supply. A zero initial supply is valid for tokens minted later.
 
 ## Allowance expiry
 
@@ -41,6 +50,25 @@ The thresholds are chosen against the longest voting window: a snapshot is read
 from `Checkpoints` while its proposal is open, and an entry that expired in that
 time would make `get_past_balance` return `0` and drop the holder's vote weight.
 30 days is above the longest voting period the create form offers.
+
+## Supply history
+
+`initialize`, `mint` and `burn` record a `Checkpoint { ledger, balance }` of the
+total supply under `SupplyCheckpoints`, collapsed to one entry per ledger like
+balance checkpoints. `get_past_total_supply(ledger)` returns the supply at the
+close of that ledger, or `0` before `initialize`.
+
+Governance freezes `quorum_required = total_supply * quorum_bps / 10_000` when a
+proposal is created, with `snapshot_ledger` set to that ledger. To audit it,
+recompute the formula from `get_past_total_supply(snapshot_ledger)`. The figure
+is the *closing* supply of that ledger, so a mint or burn later in the same
+ledger as the proposal's creation makes the two differ; the token's `mint` /
+`burn` events give the intra-ledger order if that ever needs resolving.
+
+Unlike balance checkpoints, supply history is not pruned: auditing a closed
+proposal needs it after the retention window, and supply only changes on admin
+mints and holder burns, so it grows slowly. It shares the per-entry size limit
+described below.
 
 ## Checkpoint growth
 

@@ -1,3 +1,4 @@
+import { t } from "./i18n";
 // Canonical off-site destinations, kept in one place so the footer cannot drift
 // from the repository these links point at. Issue #140.
 //
@@ -22,9 +23,9 @@ export interface ExternalLink {
 
 /** The footer and the sitemap's off-site links, in the order they are shown. */
 export const EXTERNAL_LINKS: readonly ExternalLink[] = [
-  { label: "Docs", href: DOCS_URL, description: "Architecture, deployment and governance documentation" },
-  { label: "Source", href: REPO_URL, description: "The StellarQuorum repository on GitHub" },
-  { label: "Discussions", href: DISCUSSIONS_URL, description: "Ask questions and share ideas" },
-  { label: "Issues", href: ISSUES_URL, description: "Report a bug or pick up an issue" },
-  { label: "Contributing", href: CONTRIBUTING_URL, description: "How to contribute to Quorum" },
+  { label: t("footer.docs"), href: DOCS_URL, description: t("footer.docsDescription") },
+  { label: t("footer.source"), href: REPO_URL, description: t("footer.sourceDescription") },
+  { label: t("footer.discussions"), href: DISCUSSIONS_URL, description: t("footer.discussionsDescription") },
+  { label: t("footer.issues"), href: ISSUES_URL, description: t("footer.issuesDescription") },
+  { label: t("footer.contributing"), href: CONTRIBUTING_URL, description: t("footer.contributingDescription") },
 ];

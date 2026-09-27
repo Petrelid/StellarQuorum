@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { AlertTriangle, Loader2, Wallet } from "lucide-react";
 import { useWallet } from "./WalletProvider";
+import { t } from "@/lib/i18n";
 import { formatLedger, formatTokenAmount, getVotingPower, ZERO, type VotingPower } from "@/lib/voting-power";
 
 /**
@@ -44,12 +45,12 @@ export default function VotingPowerPreview({ snapshotLedger }: { snapshotLedger:
       {!address ? (
         <p className="flex items-center gap-2 text-sm text-slate-400">
           <Wallet size={15} aria-hidden />
-          Connect your wallet to see the weight this proposal will count.
+          {t("vote.connectPower")}
         </p>
       ) : !state ? (
         <p className="flex items-center gap-2 text-sm text-slate-400">
           <Loader2 size={15} className="animate-spin" aria-hidden />
-          Reading your balance at ledger #{formatLedger(snapshotLedger)}…
+          {t("vote.reading", { ledger: formatLedger(snapshotLedger) })}
         </p>
       ) : state.status === "error" ? (
         <ReadFailure message={state.message} />
@@ -76,17 +77,13 @@ function NoVotingPower({ power, snapshotLedger }: { power: VotingPower; snapshot
     <div className="flex gap-2.5">
       <AlertTriangle size={16} className="shrink-0 mt-0.5 text-amber-400" aria-hidden />
       <div>
-        <p className="text-sm font-semibold text-white">No voting power on this proposal</p>
+        <p className="text-sm font-semibold text-white">{t("vote.noPower")}</p>
         <p className="text-xs text-slate-400 mt-1 leading-relaxed">
-          Your QUORUM balance at snapshot ledger <Ledger snapshotLedger={snapshotLedger} /> — the
-          ledger recorded when this proposal was created — was 0, so the contract rejects a vote
-          from this address with <code className="font-mono text-slate-300">NoVotingPower</code>.
+          {t("vote.noPowerBefore")} <Ledger snapshotLedger={snapshotLedger} /> {t("vote.noPowerAfter")} <code className="font-mono text-slate-300">NoVotingPower</code>.
           {power.current > ZERO && (
             <>
               {" "}
-              This wallet holds {formatTokenAmount(power.current, power.decimals)} QUORUM now. Tokens
-              acquired after ledger <Ledger snapshotLedger={snapshotLedger} /> carry no weight on a
-              proposal that was already open.
+              {t("vote.currentBalance", { amount: formatTokenAmount(power.current, power.decimals), ledger: formatLedger(snapshotLedger) })}
             </>
           )}
         </p>
@@ -99,19 +96,17 @@ function VoteWeight({ power, snapshotLedger }: { power: VotingPower; snapshotLed
   const drifted = power.current !== power.snapshot;
   return (
     <div>
-      <p className="text-xs text-slate-500">You will vote with</p>
+      <p className="text-xs text-slate-500">{t("vote.willVoteWith")}</p>
       <p className="text-lg font-bold text-white font-mono mt-0.5">
         {formatTokenAmount(power.snapshot, power.decimals)}{" "}
         <span className="text-slate-500 text-sm font-sans">QUORUM</span>
       </p>
       <p className="text-xs text-slate-400 mt-1 leading-relaxed">
-        Voting power is your QUORUM balance at snapshot ledger{" "}
-        <Ledger snapshotLedger={snapshotLedger} />, not your current balance.
+        {t("vote.snapshotBefore")} <Ledger snapshotLedger={snapshotLedger} />{t("vote.snapshotAfter")}
         {drifted && (
           <>
             {" "}
-            This wallet holds {formatTokenAmount(power.current, power.decimals)} QUORUM now — the
-            difference is not counted on this proposal.
+            {t("vote.drifted", { amount: formatTokenAmount(power.current, power.decimals) })}
           </>
         )}
       </p>
@@ -125,7 +120,7 @@ function ReadFailure({ message }: { message: string }) {
     <div className="flex gap-2.5">
       <AlertTriangle size={16} className="shrink-0 mt-0.5 text-amber-400" aria-hidden />
       <div>
-        <p className="text-sm font-semibold text-white">Voting power unavailable</p>
+        <p className="text-sm font-semibold text-white">{t("vote.powerUnavailable")}</p>
         <p className="text-xs text-slate-400 mt-1">{message}</p>
       </div>
     </div>
@@ -137,5 +132,5 @@ function Ledger({ snapshotLedger }: { snapshotLedger: number }) {
 }
 
 function describeError(error: unknown): string {
-  return error instanceof Error ? error.message : "The balance at the snapshot ledger could not be read.";
+  return error instanceof Error ? error.message : t("vote.readFailed");
 }
