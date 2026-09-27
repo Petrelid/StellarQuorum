@@ -1,15 +1,9 @@
 import Link from "next/link";
 import type { Proposal } from "@/lib/types";
+import QuorumProgress from "./QuorumProgress";
 import StatusBadge from "./StatusBadge";
-import { formatNumber, t } from "@/lib/i18n";
 import VoteBar from "./VoteBar";
-
-function daysRelative(iso: string, future: boolean): string {
-  const diff = Math.abs(new Date(iso).getTime() - Date.now());
-  const days = Math.round(diff / 86400000);
-  if (days === 0) return t(future ? "proposals.endsToday" : "proposals.endedToday");
-  return t(future ? "proposals.endsIn" : "proposals.endedAgo", { days: formatNumber(days) });
-}
+import { describeDeadline, formatAbsolute } from "@/lib/time";
 
 export default function ProposalCard({ proposal }: { proposal: Proposal }) {
   const deadline = describeDeadline(proposal);
@@ -52,6 +46,16 @@ export default function ProposalCard({ proposal }: { proposal: Proposal }) {
             <span className="text-red-400">{(proposal.againstVotes / 1000).toFixed(0)}K Against</span>
           </div>
         )}
+
+        {/* Whether this proposal can still fail for want of turnout, before a
+            reader has opened it. Also on the detail page, at full size. */}
+        <QuorumProgress
+          forVotes={proposal.forVotes}
+          againstVotes={proposal.againstVotes}
+          abstainVotes={proposal.abstainVotes}
+          quorumRequired={proposal.quorumRequired}
+          compact
+        />
       </div>
     </Link>
   );

@@ -2,8 +2,10 @@ import { render, screen } from "@testing-library/react";
 import Footer from "./Footer";
 import Navbar from "./Navbar";
 import ProposalCard from "./ProposalCard";
+import QuorumProgress from "./QuorumProgress";
 import StatusBadge from "./StatusBadge";
 import VoteBar from "./VoteBar";
+import VoterList from "./VoterList";
 import VotingPowerPreview from "./VotingPowerPreview";
 import { WalletContext, type WalletContextValue } from "./WalletProvider";
 import type { Proposal } from "@/lib/types";
@@ -82,6 +84,45 @@ describe("accessibility", () => {
   it("ProposalCard has no accessibility violations", () => {
     const { container } = render(<ProposalCard proposal={proposal} />);
     expectNoA11yViolations(container, options);
+  });
+
+  it("QuorumProgress has no accessibility violations reached, short and empty", () => {
+    // All three render differently — bar colour, and a check icon in one — so
+    // each is judged rather than assuming one covers the others.
+    for (const tallies of [
+      { forVotes: 600000, againstVotes: 0, abstainVotes: 0 },
+      { forVotes: 100000, againstVotes: 0, abstainVotes: 0 },
+      { forVotes: 0, againstVotes: 0, abstainVotes: 0 },
+    ]) {
+      const { container: full } = render(<QuorumProgress {...tallies} quorumRequired={500000} />);
+      expectNoA11yViolations(full, options);
+
+      const { container: compact } = render(<QuorumProgress {...tallies} quorumRequired={500000} compact />);
+      expectNoA11yViolations(compact, options);
+    }
+  });
+
+  it("VoterList has no accessibility violations on the first and last page", () => {
+    // A proposal with a single voter and one with enough to page: the controls
+    // that appear on the later pages are only rendered then.
+    const one = render(
+      <VoterList
+        votes={[{ voter: "GABCDEFGHIJKLMNOPQRSTUVWXYZ3XZK", choice: "for", weight: 1000, timestamp: "2026-05-12T14:22:00Z" }]}
+      />,
+    );
+    expectNoA11yViolations(one.container, options);
+
+    const many = render(
+      <VoterList
+        votes={Array.from({ length: 25 }, (_, i) => ({
+          voter: `G${i}...VOTE`,
+          choice: "against" as const,
+          weight: 1000,
+          timestamp: "2026-05-12T14:22:00Z",
+        }))}
+      />,
+    );
+    expectNoA11yViolations(many.container, options);
   });
 
   it("VotingPowerPreview has no accessibility violations before and after the read resolves", async () => {

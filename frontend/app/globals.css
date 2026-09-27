@@ -1,5 +1,21 @@
 @import "tailwindcss";
 
+/*
+ * Issue #145: the fonts next/font loads, wired into Tailwind's theme.
+ *
+ * `--font-sans` is what Tailwind's preflight puts on <html>, so overriding it
+ * here sets the app's typeface for every element; `--font-mono` backs the
+ * `font-mono` utility the contract addresses and proposal ids are set in.
+ *
+ * `inline` matters: the values are references to variables next/font declares
+ * on <html> at render time, and without it Tailwind would resolve them while
+ * building, where those variables do not exist yet, and emit `initial`.
+ */
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
 @layer base {
   body {
     background-color: #080c10;
