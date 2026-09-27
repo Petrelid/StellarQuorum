@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Quorum">
+  <rect width="512" height="512" rx="113" fill="#0d1520" />
+  <circle cx="235.52" cy="225.28" r="133.12" fill="none" stroke="#60a5fa" stroke-width="58.88" />
+  <line x1="281.6" y1="317.44" x2="404.48" y2="440.32" stroke="#60a5fa" stroke-width="58.88" stroke-linecap="butt" />
+</svg>

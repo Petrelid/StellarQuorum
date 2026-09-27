@@ -1,9 +1,11 @@
 import Link from "next/link";
 import { ArrowLeft, Clock, User } from "lucide-react";
 import { getProposalById } from "@/lib/proposals";
+import QuorumProgress from "@/components/QuorumProgress";
 import StatusBadge from "@/components/StatusBadge";
 import VoteBar from "@/components/VoteBar";
 import VoteButtons from "@/components/VoteButtons";
+import VoterList from "@/components/VoterList";
 import VotingPowerPreview from "@/components/VotingPowerPreview";
 import { formatDate, formatNumber, t } from "@/lib/i18n";
 
@@ -24,14 +26,6 @@ export default async function ProposalDetailPage({ params }: { params: Promise<{
   const forPct = formatNumber(total > 0 ? (proposal.forVotes / total) * 100 : 0, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
   const againstPct = formatNumber(total > 0 ? (proposal.againstVotes / total) * 100 : 0, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
   const abstainPct = formatNumber(total > 0 ? (proposal.abstainVotes / total) * 100 : 0, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
-  const quorumReached = total >= proposal.quorumRequired;
-  const deadline = describeDeadline(proposal);
-
-  const choiceColors: Record<string, string> = {
-    for: "text-emerald-400",
-    against: "text-red-400",
-    abstain: "text-slate-400",
-  };
 
   return (
     <div className="max-w-3xl mx-auto px-6 py-12">
@@ -83,20 +77,12 @@ export default async function ProposalDetailPage({ params }: { params: Promise<{
           <div><div className="text-red-400 font-bold">{(proposal.againstVotes / 1000).toFixed(0)}K</div><div className="text-slate-500">{t("common.against")} ({againstPct}%)</div></div>
           <div><div className="text-slate-400 font-bold">{(proposal.abstainVotes / 1000).toFixed(0)}K</div><div className="text-slate-500">{t("common.abstain")} ({abstainPct}%)</div></div>
         </div>
-        <div className="mt-4 pt-4 border-t border-[#1a2535]">
-          <div className="flex justify-between text-sm mb-1">
-            <span className="text-slate-400">{t("common.quorum")}</span>
-            <span className={quorumReached ? "text-emerald-400" : "text-amber-400"}>
-              {t("proposals.required", { current: formatNumber(total), required: formatNumber(proposal.quorumRequired) })}
-            </span>
-          </div>
-          <div className="h-2 bg-[#1a2535] rounded-full overflow-hidden">
-            <div
-              className={`h-full rounded-full transition-all ${quorumReached ? "bg-emerald-500" : total > 0 ? "bg-amber-500" : "bg-slate-600"}`}
-              style={{ width: `${Math.min((total / proposal.quorumRequired) * 100, 100)}%` }}
-            />
-          </div>
-        </div>
+        <QuorumProgress
+          forVotes={proposal.forVotes}
+          againstVotes={proposal.againstVotes}
+          abstainVotes={proposal.abstainVotes}
+          quorumRequired={proposal.quorumRequired}
+        />
       </div>
 
       {/* Vote CTA */}
@@ -116,28 +102,7 @@ export default async function ProposalDetailPage({ params }: { params: Promise<{
       {proposal.votes.length > 0 && (
         <div className="p-5 rounded-xl bg-[#0d1520] border border-[#1a2535]">
           <h2 className="font-semibold text-white mb-3">{t("proposals.recentVotes")}</h2>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-left text-slate-500 border-b border-[#1a2535]">
-                  <th className="pb-2 pr-4">{t("proposals.voter")}</th>
-                  <th className="pb-2 pr-4">{t("proposals.choice")}</th>
-                  <th className="pb-2 pr-4">{t("proposals.weight")}</th>
-                  <th className="pb-2">{t("proposals.time")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {proposal.votes.map((vote, i) => (
-                  <tr key={i} className="border-b border-[#0f1a28] last:border-0">
-                    <td className="py-2 pr-4 font-mono text-xs text-slate-400">{vote.voter}</td>
-                    <td className={`py-2 pr-4 font-semibold capitalize ${choiceColors[vote.choice]}`}>{vote.choice}</td>
-                    <td className="py-2 pr-4 text-slate-400">{(vote.weight / 1000).toFixed(0)}K</td>
-                    <td className="py-2 text-slate-500 text-xs">{formatDate(vote.timestamp)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <VoterList votes={proposal.votes} />
         </div>
       )}
     </div>
