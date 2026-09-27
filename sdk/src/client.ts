@@ -10,6 +10,28 @@ import type { Proposal, GovernanceConfig, QuorumClientConfig, VoteSupport } from
  */
 const READ_ONLY_SOURCE = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 
+/**
+ * Whether a plain-HTTP RPC URL may be used.
+ *
+ * The stellar-sdk refuses insecure URLs unless `allowHttp` is set; allow
+ * them only for loopback hosts (local nodes, the test mock RPC) so every
+ * remote endpoint keeps the SDK's HTTPS requirement.
+ */
+function allowsInsecureRpc(rpcUrl: string): boolean {
+  let hostname: string;
+  try {
+    hostname = new URL(rpcUrl).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return (
+    hostname === 'localhost' ||
+    hostname === '::1' ||
+    hostname === '[::1]' ||
+    /^127(\.\d{1,3}){3}$/.test(hostname)
+  );
+}
+
 export class QuorumClient {
   private server: SorobanRpc.Server;
   private governance: Contract;
@@ -17,7 +39,7 @@ export class QuorumClient {
 
   constructor(config: QuorumClientConfig) {
     this.config = config;
-    this.server = new SorobanRpc.Server(config.rpcUrl);
+    this.server = new SorobanRpc.Server(config.rpcUrl, { allowHttp: allowsInsecureRpc(config.rpcUrl) });
     this.governance = new Contract(config.governanceContractId);
   }
 

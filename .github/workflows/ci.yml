@@ -111,7 +111,7 @@ jobs:
         run: cd frontend && npm audit --audit-level=high
 
   sdk:
-    name: Build SDK
+    name: Build and test SDK
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -120,6 +120,8 @@ jobs:
           node-version: 20
       - run: cd sdk && npm ci
       - run: cd sdk && npm run build
+      # Runs fully offline against the mock RPC server in sdk/test/.
+      - run: cd sdk && npm test
       # Issue #179: sdk/ currently has two known high-severity advisories
       # with no automated check surfacing them.
       - name: npm audit (high + critical)
