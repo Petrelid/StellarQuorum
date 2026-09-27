@@ -121,6 +121,21 @@ All test suites and verification checks must pass before opening or merging a pu
 | **SDK** | Client SDK tests (`sdk/`) | `cd sdk && npm test` | `npm test` |
 | **Integration Stubs** | Integration test stubs (`tests/`) | `cd frontend && npx jest ../tests` | `npx jest tests/` |
 
+### Mutation Testing
+
+The contract suites also have a mutation run: `cargo mutants` rewrites guards,
+operators and constants in `contracts/*/src/lib.rs` one at a time and reruns the
+tests, which is the only way to tell that an assertion would actually catch the
+regression it claims to. It is not in per-PR CI (a full run takes ~2 hours);
+the latest run, its results and the triage of every surviving mutant are
+documented in [docs/mutation-testing.md](docs/mutation-testing.md).
+
+```bash
+cargo install cargo-mutants
+cd contracts
+cargo mutants --workspace --in-place --colors never   # results in mutants.out/
+```
+
 ### Prerequisites and Toolchains
 
 To run all test suites locally, ensure you have the following toolchains installed:
