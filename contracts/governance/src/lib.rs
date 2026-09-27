@@ -34,10 +34,17 @@ pub enum GovernanceError {
     Overflow                = 13,
     NoVotingPower           = 14,
     NotInitialized          = 15,
+    InvalidQuorumBps        = 16,
 }
 
 /// Basis-point denominator: `quorum_bps` of 500 means 5% of total supply.
 const BPS_DENOMINATOR: i128 = 10_000;
+
+/// Largest `quorum_bps` that can still be reached. 10000 means "the entire
+/// supply must vote", which is a legitimate (if strict) setting; anything
+/// above it demands more votes than exist, so no proposal could ever reach
+/// quorum and there is no way to recover the parameter.
+const MAX_QUORUM_BPS: u32 = 10_000;
 
 /// Ledgers in roughly one day, at Stellar's ~5 second close time.
 const LEDGERS_PER_DAY: u32 = 17_280;
@@ -172,6 +179,12 @@ impl GovernanceContract {
     pub fn initialize(env: Env, admin: Address, token: Address, quorum_bps: u32, voting_period: u32, timelock_period: u32, proposal_threshold: i128) -> Result<(), GovernanceError> {
         if env.storage().instance().has(&DataKey::Config) {
             return Err(GovernanceError::AlreadyInitialized);
+        }
+        // Reject an unreachable quorum before any state is written. Above
+        // MAX_QUORUM_BPS the required votes exceed the total supply, so every
+        // proposal would fail forever and the parameter could never be fixed.
+        if quorum_bps > MAX_QUORUM_BPS {
+            return Err(GovernanceError::InvalidQuorumBps);
         }
         admin.require_auth();
         let config = Config { token, quorum_bps, voting_period, timelock_period, proposal_threshold, admin };
@@ -393,7 +406,8 @@ impl GovernanceContract {
             .ok_or(GovernanceError::Unauthorized)?;
         pending.require_auth();
         let mut config = Self::require_config(&env)?;
-        config.admin = pending;
+        let previous_admin = config.admin.clone();
+        config.admin = pending.clone();
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().remove(&DataKey::PendingAdmin);
 

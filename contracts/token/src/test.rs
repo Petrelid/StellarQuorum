@@ -911,7 +911,7 @@ fn a_negative_approval_is_rejected() {
 #[test]
 fn transfer_admin_hands_minting_rights_to_the_new_admin() {
     let env = Env::default();
-    let (admin, token) = deploy(&env);
+    let (_admin, token) = deploy(&env);
     let new_admin = Address::generate(&env);
 
     token.transfer_admin(&new_admin);
@@ -1163,7 +1163,7 @@ impl Xorshift32 {
 /// Naive O(n) scan mirroring the contract's contract: the balance in effect
 /// at `ledger` is the most recent checkpoint at or before it, or 0 if none
 /// qualifies (including an empty history).
-fn naive_past_balance(history: &std::vec::Vec<(u32, i128)>, ledger: u32) -> i128 {
+fn naive_past_balance(history: &[(u32, i128)], ledger: u32) -> i128 {
     history
         .iter()
         .rev()
@@ -1407,7 +1407,7 @@ fn history_just_past_the_window_keeps_one_anchor_and_the_new_entry() {
 #[test]
 fn cancel_admin_transfer_stops_handover() {
     let env = Env::default();
-    let (admin, token) = deploy(&env);
+    let (_admin, token) = deploy(&env);
     let new_admin = Address::generate(&env);
 
     token.transfer_admin(&new_admin);

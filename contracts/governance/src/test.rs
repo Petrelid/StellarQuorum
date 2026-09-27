@@ -317,7 +317,12 @@ fn admin_can_transfer_governance_administration_and_emits_event() {
     let governance = GovernanceContractClient::new(&env, &governance_id);
     let new_admin = Address::generate(&env);
 
+    // transfer_admin only nominates: control must not move until the
+    // nominee accepts, and no rotation is announced yet.
     governance.transfer_admin(&new_admin);
+    assert_eq!(governance.try_get_config().unwrap().unwrap().admin, admin.clone());
+
+    governance.accept_admin();
 
     let (topics, data) = last_governance_event(&env, &governance_id);
     assert_eq!(
@@ -1087,7 +1092,8 @@ fn executing_emits_proposal_executed() {
 
     env.ledger()
         .set_sequence_number(governance.get_proposal(&proposal_id).queue_ledger);
-    governance.execute(&Address::generate(&env), &proposal_id);
+    let executor = Address::generate(&env);
+    governance.execute(&executor, &proposal_id);
 
     let (topics, data) = last_governance_event(&env, &governance_id);
     assert_eq!(
@@ -1096,7 +1102,7 @@ fn executing_emits_proposal_executed() {
     );
     assert_eq!(
         ProposalExecuted::try_from_val(&env, &data).unwrap(),
-        ProposalExecuted { id: proposal_id , executor: Address::generate(&env) }
+        ProposalExecuted { id: proposal_id, executor }
     );
 }
 
@@ -1347,13 +1353,14 @@ fn full_lifecycle_passes_and_executes_after_timelock() {
 
     // ── Wait out the timelock and execute ──
     env.ledger().set_sequence_number(finalized.queue_ledger);
-    governance.execute(&Address::generate(&env), &id);
+    let executor = Address::generate(&env);
+    governance.execute(&executor, &id);
 
     let (topics, data) = last_governance_event(&env, &governance_id);
     assert_eq!(topics, (Symbol::new(&env, "proposal_executed"), id).into_val(&env));
     assert_eq!(
         ProposalExecuted::try_from_val(&env, &data).unwrap(),
-        ProposalExecuted { id, executor: Address::generate(&env) }
+        ProposalExecuted { id, executor }
     );
 
     let executed = governance.get_proposal(&id);
@@ -1496,7 +1503,13 @@ fn create_proposal_only_requires_the_proposers_auth() {
         invoke: &MockAuthInvoke {
             contract: &governance_id,
             fn_name: "create_proposal",
-            args: (admin.clone(), title.clone(), description.clone()).into_val(&env),
+            args: (
+                admin.clone(),
+                title.clone(),
+                description.clone(),
+                String::from_str(&env, ""),
+            )
+                .into_val(&env),
             // No sub_invokes: create_proposal cross-invokes token.balance() and
             // token.total_supply(), and this succeeding with an empty tree
             // proves neither one requires auth today.
@@ -1525,7 +1538,13 @@ fn voting_only_requires_the_voters_auth() {
         invoke: &MockAuthInvoke {
             contract: &governance_id,
             fn_name: "create_proposal",
-            args: (admin.clone(), title.clone(), description.clone()).into_val(&env),
+            args: (
+                admin.clone(),
+                title.clone(),
+                description.clone(),
+                String::from_str(&env, ""),
+            )
+                .into_val(&env),
             sub_invokes: &[],
         },
     }]);
@@ -1683,3 +1702,96 @@ fn get_config_returns_not_initialized_before_initialize() {
     assert!(governance.try_get_config().is_err());
 }
 
+
+// ─── quorum_bps ceiling (#69) ───────────────────────────────────────────────
+//
+// quorum_for_supply() scales total supply by quorum_bps / 10000, so any
+// quorum_bps above 10000 demands more votes than the whole supply holds. Every
+// proposal would then be permanently un-reachable, and with no update_config()
+// the governor could never be reconfigured into a usable state.
+
+/// 10000 is the largest value that stays reachable, so it must be accepted.
+///
+/// Reachability is proven behaviourally, not by restating the arithmetic: the
+/// required votes must equal the whole supply (not exceed it), and a proposal
+/// voted unanimously must finalize as Queued rather than fail quorum forever.
+#[test]
+fn initialize_accepts_the_highest_reachable_quorum_bps() {
+    let env = Env::default();
+    let holder = Address::generate(&env);
+    // 600_000 granted away, so admin keeps 400_000: together they cover the
+    // entire 1_000_000 supply.
+    let (admin, governance_id, proposal_id) =
+        open_with_holders(&env, 1_000_000, 10_000, &[(holder.clone(), 600_000)]);
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+
+    assert_eq!(governance.get_config().quorum_bps, 10_000);
+    // The ceiling requires the whole supply, not more than the whole supply.
+    assert_eq!(governance.get_proposal(&proposal_id).quorum_required, 1_000_000);
+
+    governance.vote(&admin, &proposal_id, &VOTE_FOR);
+    governance.vote(&holder, &proposal_id, &VOTE_FOR);
+    close_voting(&env, &governance, proposal_id);
+
+    // Unanimous supply, so the proposal clears quorum and is queueable.
+    assert_eq!(governance.finalize(&proposal_id), ProposalStatus::Queued);
+}
+
+/// One unit above the ceiling is unreachable, so initialize must refuse it.
+#[test]
+fn initialize_rejects_a_quorum_bps_above_the_reachable_ceiling() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let token_id = env.register(QuorumToken, ());
+    let governance_id = env.register(GovernanceContract, ());
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+
+    assert_eq!(
+        governance.try_initialize(
+            &admin,
+            &token_id,
+            &10_001,
+            &VOTING_PERIOD,
+            &TIMELOCK_PERIOD,
+            &PROPOSAL_THRESHOLD,
+        ),
+        Err(Ok(GovernanceError::InvalidQuorumBps))
+    );
+}
+
+/// A rejected quorum must not latch: the guard runs before any storage write,
+/// so a valid initialize must still succeed on the same contract afterwards.
+#[test]
+fn a_rejected_quorum_bps_leaves_the_governor_uninitialized() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let token_id = env.register(QuorumToken, ());
+    let governance_id = env.register(GovernanceContract, ());
+    let governance = GovernanceContractClient::new(&env, &governance_id);
+
+    assert_eq!(
+        governance.try_initialize(
+            &admin,
+            &token_id,
+            &10_001,
+            &VOTING_PERIOD,
+            &TIMELOCK_PERIOD,
+            &PROPOSAL_THRESHOLD,
+        ),
+        Err(Ok(GovernanceError::InvalidQuorumBps))
+    );
+    // Uninitialized: reading the config still fails.
+    assert!(governance.try_get_config().is_err());
+
+    // Retry with a reachable value succeeds, proving nothing was persisted.
+    env.mock_all_auths();
+    governance.initialize(
+        &admin,
+        &token_id,
+        &QUORUM_BPS,
+        &VOTING_PERIOD,
+        &TIMELOCK_PERIOD,
+        &PROPOSAL_THRESHOLD,
+    );
+    assert_eq!(governance.get_config().quorum_bps, QUORUM_BPS);
+}
