@@ -136,6 +136,30 @@ cd contracts
 cargo mutants --workspace --in-place --colors never   # results in mutants.out/
 ```
 
+### Fuzz Testing
+
+`contracts/fuzz/` holds two `cargo-fuzz` targets, `vote` and `finalize`, that
+drive the governance entry points with untrusted input: raw `support` values,
+full-range `u32` voting and timelock periods, supplies up to `i128::MAX`,
+arbitrary proposal ids and ledger jumps. Besides success and declared contract
+errors, the harness treats invoke-level failures as crashes — that is how a
+trap emulated from a native panic (overflow, `panic!`, unwrap) surfaces. Two
+such traps were found and fixed this way (`end_ledger` in `create_proposal`,
+`queue_ledger` in `finalize`). It is not in per-PR CI; run it after touching
+tally, quorum, window or timelock arithmetic.
+
+```bash
+cargo install cargo-fuzz
+cd contracts
+cargo +nightly fuzz run vote -- -max_total_time=120       # any nightly; set RUSTUP_TOOLCHAIN if yours is pinned
+cargo +nightly fuzz run finalize -- -max_total_time=120
+```
+
+Hand-written seed cases live in `contracts/fuzz/corpus/{vote,finalize}/` and
+are committed; inputs a run discovers are added to the same directories. Crashes
+land in `contracts/fuzz/artifacts/` (gitignored): minimize with
+`cargo fuzz tmin <target> <crash-file>` and keep the result as a corpus seed.
+
 ### Prerequisites and Toolchains
 
 To run all test suites locally, ensure you have the following toolchains installed:

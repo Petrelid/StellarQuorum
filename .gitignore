@@ -52,3 +52,7 @@ next-env.d.ts
 
 # cargo-mutants output (contracts/mutants.out, rotated to mutants.out.old)
 **/mutants.out*/
+
+# cargo-fuzz build artifacts and crash inputs (corpus seeds are committed)
+/contracts/fuzz/target/
+/contracts/fuzz/artifacts/
